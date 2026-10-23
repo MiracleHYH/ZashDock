@@ -1,0 +1,58 @@
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Xcode and SwiftPM build products / local state
+build/
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.xcresult/
+*.xcarchive/
+*.dSYM/
+*.dia
+
+# Shared project settings, schemes, and application Package.resolved files
+# intentionally remain trackable. Do not add a general lockfile exclusion.
+
+# Generated applications and distribution archives
+*.app/
+*.dmg
+*.pkg
+*.ipa
+*.zip
+artifacts/
+dist/
+
+# Local configuration, credentials, signing material, and sensitive backups
+.local/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.local
+*.keychain
+*.keychain-db
+*.keychain.*
+*.p12
+*.pfx
+*.p8
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.provisionprofile
+
+# Editor state and temporary files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.tmp

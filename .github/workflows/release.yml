@@ -1,0 +1,70 @@
+name: Publish signed ZashDock
+
+# A source push or a tag push never creates a release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, for example 1.0.0 (without v)'
+        required: true
+        type: string
+      build_number:
+        description: 'Positive integer, greater than every published build'
+        required: true
+        type: string
+      confirm:
+        description: 'Type PUBLISH to create a public release and update the feed'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Only one publisher may prepare or update the feed at a time.
+concurrency:
+  group: zashdock-production-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'MiracleHYH/ZashDock' && github.ref == 'refs/heads/main' && inputs.confirm == 'PUBLISH'
+    name: Sign, notarize, and publish
+    environment: release
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the requested main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test the source before loading release credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          Scripts/test-core.sh
+          xcodebuild -project ZashDock.xcodeproj -scheme ZashDock \
+            -configuration Debug -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build/ReleaseTests -resultBundlePath build/ReleaseTests.xcresult \
+            CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES test
+
+      - name: Publish the signed App and feed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_BUILD_NUMBER: ${{ inputs.build_number }}
+          RELEASE_CONFIRM: ${{ inputs.confirm }}
+          DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: Scripts/release.sh --publish
