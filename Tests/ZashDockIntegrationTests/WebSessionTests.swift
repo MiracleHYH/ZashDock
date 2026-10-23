@@ -17,7 +17,7 @@ struct WebSessionTests {
         try Data("<html><body><div id='app'>原生 WebPage 测试</div><script>document.documentElement.dataset.loaded='yes';</script></body></html>".utf8).write(to: directory.appendingPathComponent("index.html"))
         let server = try await bindFixture(directory)
         defer { server.stop() }
-        let session = WebSession(origin: server.baseURL)
+        let session = WebSession(origin: server.baseURL, dataStore: .nonPersistent())
         try await session.loadAndVerify()
         let result = try await session.page.callJavaScript("return document.documentElement.dataset.loaded;")
         #expect(result as? String == "yes")

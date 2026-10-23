@@ -17,7 +17,7 @@ public struct SafeZIPExtractor: Sendable {
     public init(limits: Limits = .standard) { self.limits = limits }
 
     /// Destination must be an empty, newly created private staging directory.
-    public func extract(_ archive: URL, to destination: URL) throws {
+    public func extract(_ archive: URL, to destination: URL, requiresJavaScript: Bool = true) throws {
         let values = try archive.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true,
               let size = values.fileSize, size > 0, Int64(size) <= limits.maxArchiveBytes else { throw invalid("ZIP 文件无效或过大。") }
@@ -31,7 +31,7 @@ public struct SafeZIPExtractor: Sendable {
         if roots.contains("index.html") { prefix = "" }
         else if roots.contains("dist/index.html"), entries.allSatisfy({ $0.path == "dist/" || $0.path.hasPrefix("dist/") }) { prefix = "dist/" }
         else { throw invalid("ZIP 缺少根目录 index.html，或含有非网页发行目录。") }
-        guard entries.contains(where: { !$0.directory && $0.path.hasPrefix(prefix) && $0.path.hasSuffix(".js") }) else {
+        guard !requiresJavaScript || entries.contains(where: { !$0.directory && $0.path.hasPrefix(prefix) && $0.path.hasSuffix(".js") }) else {
             throw invalid("ZIP 缺少 JavaScript 网页资源。")
         }
         for entry in entries {
@@ -54,9 +54,12 @@ public struct SafeZIPExtractor: Sendable {
             }
         }
         let index = try Data(contentsOf: destination.appendingPathComponent("index.html"))
-        guard !index.isEmpty, index.count < 4_194_304,
-              let html = String(data: index, encoding: .utf8), html.lowercased().contains("<html"), html.lowercased().contains("<script") else {
+        guard !index.isEmpty else { throw invalid("index.html 为空。") }
+        if requiresJavaScript {
+            guard index.count < 4_194_304,
+                  let html = String(data: index, encoding: .utf8), html.lowercased().contains("<html"), html.lowercased().contains("<script") else {
             throw invalid("index.html 不是有效的应用入口。")
+            }
         }
     }
 

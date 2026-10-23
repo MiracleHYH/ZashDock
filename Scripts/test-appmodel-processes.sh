@@ -109,6 +109,7 @@ printf '%s\n' 'PASS: external SIGKILL after observing actual AppModel configurat
 # Old port stays occupied across writer death and both independent cold starts.
 run_process verify-new
 run_process verify-new-again
+jq -e 'has("maxRollbackVersions") | not' "$fixture_root/app-root/configuration.json" > /dev/null
 sleep 0.1
 jq -e '.connections == 0' "$fixture_root/sentinel-count.json" > /dev/null
 unique_pids=$(printf '%s\n' "${harness_pids[@]}" | sort -u | wc -l | tr -d ' ')

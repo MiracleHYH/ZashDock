@@ -21,7 +21,7 @@ struct MihomoConnectionTests {
         defer { mihomo.stop() }
         #expect(panel.port != mihomo.port)
 
-        let session = WebSession(origin: panel.baseURL)
+        let session = WebSession(origin: panel.baseURL, dataStore: .nonPersistent())
         defer { session.stop() }
         try await session.loadAndVerify()
 
@@ -102,7 +102,7 @@ struct MihomoConnectionTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let panel = try await bindFixture(directory)
         defer { panel.stop() }
-        let session = WebSession(origin: panel.baseURL)
+        let session = WebSession(origin: panel.baseURL, dataStore: .nonPersistent())
         defer { session.stop() }
         try await session.loadAndVerify()
         let result = try await session.page.callJavaScript("""

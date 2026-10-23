@@ -76,7 +76,6 @@ private extension Data {
     try Data("partial".utf8).write(to: staging.appendingPathComponent("partial.zip"))
     let store = try VersionStore(root: root)
     #expect(try await store.current() == nil)
-    #expect(try await store.history().isEmpty)
     #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
 }
 
@@ -128,23 +127,14 @@ func rejectsZIPSlip(path: String) throws {
     #expect(throws: (any Error).self) { try SafeZIPExtractor(limits: limits).extract(source, to: target) }
 }
 
-@Test(arguments: [0, 1, 3]) func retentionCountsAndRollbackUseActivationOrder(maxHistory: Int) async throws {
+@Test func successfulResourceReplacementKeepsOnlyCurrentVersion() async throws {
     let root = try Fixture.directory(); defer { try? FileManager.default.removeItem(at: root) }
     let store = try VersionStore(root: root)
-    var installed: [InstalledVersion] = []
     for number in 1...6 {
         let version = try await Fixture.install(number, store: store, root: root)
-        installed.append(version); try await store.activate(version); try await store.prune(maxHistory: maxHistory)
-        #expect(try await store.current()?.id == version.id)
-        #expect(try await store.history().count == min(number - 1, maxHistory))
-        #expect(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("versions").path).count == min(number, maxHistory + 1))
-    }
-    if maxHistory > 0 {
-        let previous = try #require(await store.history().first)
-        try await store.activate(previous); try await store.prune(maxHistory: maxHistory)
-        #expect(try await store.current()?.id == previous.id)
-        #expect(try await store.history().first?.id == installed.last?.id)
-        #expect(try await store.history().count == maxHistory)
+        try await store.activate(version); try await store.removeInactiveVersions()
+        #expect(try await store.current() == version)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("versions").path).count == 1)
     }
 }
 
@@ -155,14 +145,13 @@ func rejectsZIPSlip(path: String) throws {
     let snapshot = root.appendingPathComponent("storage.aesgcm"); try Data([1,2,3]).write(to: snapshot)
     let second = try await Fixture.install(2, store: store, root: root)
     #expect(try await store.current() == first)
-    #expect(try await store.history().isEmpty)
     let damaged = root.appendingPathComponent("damaged.zip"); try Data([1,2,3]).write(to: damaged)
     let official = Fixture.release(Fixture.zip(Fixture.items(3)), number: 3)
     await #expect(throws: (any Error).self) { try await store.prepare(zip: damaged, release: official) }
     #expect(try await store.current() == first)
-    try await store.activate(second); try await store.prune(maxHistory: 0, protecting: [first.id])
+    try await store.activate(second); try await store.removeInactiveVersions(protecting: [first.id])
     #expect(FileManager.default.fileExists(atPath: first.directoryURL.path))
-    try await store.prune(maxHistory: 0)
+    try await store.removeInactiveVersions()
     #expect(!FileManager.default.fileExists(atPath: first.directoryURL.path))
     #expect(try Data(contentsOf: snapshot) == Data([1,2,3]))
     let reopened = try VersionStore(root: root)
@@ -181,16 +170,9 @@ func rejectsZIPSlip(path: String) throws {
     #expect(try await store.current() == repaired)
 }
 
-@Test func rejectsUntrustedReleaseAndUnknownOfflineZIP() async throws {
-    try ZashboardRelease.offlineSeed.validate()
+@Test func networkReleaseStillRejectsUntrustedSource() throws {
     let release = ZashboardRelease(tag: "v1", publishedAt: Date(), assetURL: URL(string: "https://example.com/dist.zip")!, assetSize: 1, sha256: String(repeating: "a", count: 64))
     #expect(throws: (any Error).self) { try release.validate() }
-    let root = try Fixture.directory(); defer { try? FileManager.default.removeItem(at: root) }
-    let source = root.appendingPathComponent("unofficial.zip"); try Fixture.zip(Fixture.items()).write(to: source)
-    let client = ReleaseClient()
-    await #expect(throws: (any Error).self) { try await client.identifyLocalZIP(source) }
-    let catalog = try await client.catalogForLocalImport()
-    #expect(catalog.contains(.offlineSeed))
 }
 
 @Test func cancelledPreparationDoesNotActivateOrLeakStaging() async throws {
@@ -208,12 +190,11 @@ func rejectsZIPSlip(path: String) throws {
 @Test(.enabled(if: ProcessInfo.processInfo.environment["ZASHDOCK_LIVE_INSTALL_TEST"] == "1"))
 func officialLiveDownloadAndPrepare() async throws {
     let root = try Fixture.directory(); defer { try? FileManager.default.removeItem(at: root) }
-    let client = ReleaseClient(catalogURL: root.appendingPathComponent("catalog.json"))
+    let client = ReleaseClient()
     let release = try await client.latest()
     try release.validate()
     let archive = root.appendingPathComponent("official.zip")
     try await client.download(release, to: archive)
-    #expect(try await client.identifyLocalZIP(archive) == release)
     let store = try VersionStore(root: root)
     let installed = try await store.prepare(zip: archive, release: release)
     #expect(installed.tag == release.tag)
@@ -227,10 +208,8 @@ func officialLiveDownloadAndPrepare() async throws {
 @MainActor @Test func managerLocalImportFailureRetryAndCommit() async throws {
     let root = try Fixture.directory(); defer { try? FileManager.default.removeItem(at: root) }
     let store = try VersionStore(root: root)
-    let bytes = Fixture.zip(Fixture.items()), official = Fixture.release(bytes)
-    let catalogURL = root.appendingPathComponent("catalog.json")
-    try AtomicFile.encode([official], to: catalogURL)
-    let client = ReleaseClient(catalogURL: catalogURL)
+    let bytes = Fixture.zip(Fixture.items())
+    let client = ReleaseClient()
     let manager = ZashboardUpdateManager(store: store, client: client, downloadDirectory: root.appendingPathComponent("staging"))
     let invalid = root.appendingPathComponent("invalid.zip"); try Data([1,2,3]).write(to: invalid)
     await #expect(throws: (any Error).self) { try await manager.stageLocalZIP(invalid) }
@@ -239,17 +218,16 @@ func officialLiveDownloadAndPrepare() async throws {
     let candidate = try await manager.stageLocalZIP(valid)
     #expect(manager.lastError == nil); #expect(!manager.isBusy)
     #expect(try await store.current() == nil)
-    try await manager.commit(version: candidate, maxHistory: 1)
+    try await manager.commit(version: candidate)
     #expect(try await store.current() == candidate)
 }
 
-@MainActor @Test func managerCancellationCoversCatalogIdentification() async throws {
+@MainActor @Test func managerCancellationCoversLocalExtraction() async throws {
     let root = try Fixture.directory(); defer { try? FileManager.default.removeItem(at: root) }
     let store = try VersionStore(root: root)
     var items = Fixture.items(); items[1].data = Data(repeating: 65, count: 8 * 1_024 * 1_024)
-    let bytes = Fixture.zip(items), catalog = root.appendingPathComponent("catalog.json")
-    try AtomicFile.encode([Fixture.release(bytes)], to: catalog)
-    let client = ReleaseClient(catalogURL: catalog)
+    let bytes = Fixture.zip(items)
+    let client = ReleaseClient()
     let manager = ZashboardUpdateManager(store: store, client: client, downloadDirectory: root.appendingPathComponent("staging"))
     let valid = root.appendingPathComponent("valid.zip"); try bytes.write(to: valid)
     let task = Task { try await manager.stageLocalZIP(valid) }
@@ -269,18 +247,6 @@ func officialLiveDownloadAndPrepare() async throws {
     #expect(try await store.current() == first)
     try await store.discardPrepared(candidate)
     #expect(!FileManager.default.fileExists(atPath: candidate.directoryURL.path))
-    #expect(try await store.history().isEmpty)
-}
-
-@Test func corruptedCatalogDoesNotDisableOfficialOfflineSeed() async throws {
-    let root = try Fixture.directory(); defer { try? FileManager.default.removeItem(at: root) }
-    let catalog = root.appendingPathComponent("catalog.json")
-    try Data("{truncated".utf8).write(to: catalog)
-    let client = ReleaseClient(catalogURL: catalog)
-    #expect(try await client.catalogForLocalImport().contains(.offlineSeed))
-    let bad = ZashboardRelease(tag: "bad", publishedAt: Date(), assetURL: URL(string: "https://attacker.example/dist.zip")!, assetSize: 1, sha256: "bad")
-    try AtomicFile.encode([bad], to: catalog)
-    #expect(try await client.catalogForLocalImport() == [.offlineSeed])
 }
 
 @Test func boundedZIPCopyRejectsReplacementGrowthAndSymlinks() throws {

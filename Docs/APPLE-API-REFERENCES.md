@@ -8,6 +8,12 @@
 
 当前实际运行环境为 macOS 27.0.1、Xcode 27.1。已有 arm64 Debug 和 macOS 26.5 SDK 编译证据；这不代表已在 macOS 26.0 实机运行，也不代表系统重启或断电恢复已经测试。完整执行范围由测试记录限定。
 
+## 系统应用菜单与关于面板
+
+`Settings` Scene 自带 macOS 应用菜单“设置…”与 ⌘,，无需在主窗口重复添加齿轮或创建 MenuBarExtra。`CommandGroup(replacing: .appInfo)` 用于提供“关于 ZashDock”命令。[Settings](https://developer.apple.com/documentation/swiftui/settings)、[appInfo](https://developer.apple.com/documentation/swiftui/commandgroupplacement/appinfo)。
+
+关于命令调用 `NSApplication.orderFrontStandardAboutPanel(options:)`。`.applicationVersion` 对应应用营销版本，`.version` 对应应用构建号，不能将 Zashboard 版本作为 ZashDock 构建号。当前显式清空默认版本项，通过 `.credits` 的 `NSAttributedString` 同时写出两个名称和完整版本，使用系统字体与自动文本颜色。SDK 头文件明确说明空 `.version` 留空；显式空 `.applicationVersion` 对默认值的覆盖另由实际原生界面验证。[标准关于面板](https://developer.apple.com/documentation/appkit/nsapplication/orderfrontstandardaboutpanel(options:))、[version](https://developer.apple.com/documentation/appkit/nsapplication/aboutpaneloptionkey/version)、[credits](https://developer.apple.com/documentation/appkit/nsapplication/aboutpaneloptionkey/credits)。
+
 ## WebKit for SwiftUI 与数据容器
 
 `WebPage`、`WebView` 和 `WebPage.Configuration` 是 macOS 26 的公开 API，页面及配置在 MainActor 上使用。配置直接提供 `websiteDataStore` 和 `userContentController`，不需要用 `NSViewRepresentable` 包装旧式 `WKWebView` 获得这两项能力。[WebPage](https://developer.apple.com/documentation/webkit/webpage)、[WebView](https://developer.apple.com/documentation/webkit/webview-swift.struct)、[Configuration](https://developer.apple.com/documentation/webkit/webpage/configuration)。
@@ -16,7 +22,7 @@
 | --- | --- | --- |
 | 日常官方网页 | `.default()` | 由 WebKit 将网站数据持久保存到磁盘 |
 | 按需端口转移的可信文档 | 同一 `.default()` | 读取旧 Origin、恢复并核验目标 Origin |
-| 新版/回滚候选预检 | 新建 `.nonPersistent()` | 隔离候选代码，仅使用内存，不写真实用户容器 |
+| 新安装/更新候选预检 | 新建 `.nonPersistent()` | 隔离候选代码，仅使用内存，不写真实用户容器 |
 | 自动测试 | 注入隔离容器 | 避免访问生产配置、网站数据和 Keychain |
 
 Apple 明确区分默认持久容器与不写盘的内存容器。使用 `.nonPersistent()` 预检不改变生产持久化选择；它不是日常页面的数据源。[default()](https://developer.apple.com/documentation/webkit/wkwebsitedatastore/default())、[nonPersistent()](https://developer.apple.com/documentation/webkit/wkwebsitedatastore/nonpersistent())。

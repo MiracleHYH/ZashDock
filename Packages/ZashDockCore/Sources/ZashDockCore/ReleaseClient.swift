@@ -1,6 +1,40 @@
 import Foundation
 import CryptoKit
 
+/// Safe, actionable failures for the official release catalog. Response bodies are never surfaced.
+public enum ReleaseCatalogError: LocalizedError, Equatable, Sendable {
+    case rateLimited(status: Int, retryAt: Date?)
+    case httpStatus(Int)
+    case untrustedSource
+    case invalidResponse
+    case responseTooLarge
+    case invalidJSON
+    case invalidMetadata
+
+    public var errorDescription: String? {
+        switch self {
+        case let .rateLimited(status, retryAt):
+            if let retryAt {
+                let time = retryAt.formatted(date: .abbreviated, time: .standard)
+                return "GitHub API 请求次数已达限制（HTTP \(status)）。请在 \(time) 后重试，或导入本地 ZIP。"
+            }
+            return "GitHub API 暂时限制请求（HTTP \(status)）。请稍后重试，或导入本地 ZIP。"
+        case .httpStatus(let status):
+            return "GitHub 官方版本查询失败（HTTP \(status)）。请稍后重试。"
+        case .untrustedSource:
+            return "GitHub 版本响应来源不受信任，或返回了未接受的重定向。"
+        case .invalidResponse:
+            return "GitHub 版本查询未返回有效的 HTTP 响应。"
+        case .responseTooLarge:
+            return "GitHub 版本目录超过 8 MiB 安全限制。"
+        case .invalidJSON:
+            return "GitHub 版本目录格式无效，无法读取官方发行信息。"
+        case .invalidMetadata:
+            return "官方稳定版缺少可信的 dist.zip、SHA-256 或有效发行元数据。"
+        }
+    }
+}
+
 public struct ZashboardRelease: Codable, Sendable, Identifiable, Equatable {
     public let tag: String
     public let publishedAt: Date
@@ -13,13 +47,6 @@ public struct ZashboardRelease: Codable, Sendable, Identifiable, Equatable {
         self.tag = tag; self.publishedAt = publishedAt; self.assetURL = assetURL
         self.assetSize = assetSize; self.sha256 = sha256.lowercased()
     }
-
-    /// Metadata only, obtained from the official Releases API on 2026-10-23. No web assets are bundled.
-    public static let offlineSeed = ZashboardRelease(
-        tag: "v3.29.1", publishedAt: Date(timeIntervalSince1970: 1_790_151_447),
-        assetURL: URL(string: "https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist.zip")!,
-        assetSize: 9_570_334,
-        sha256: "4f16cce229e223bd07b5a3daccfbfb8bf349d7335572d412959284ab6c9bab50")
 
     public func validate() throws {
         guard !tag.isEmpty, tag.utf8.count <= 100,
@@ -63,14 +90,18 @@ private final class OfficialRedirectDelegate: NSObject, URLSessionTaskDelegate, 
 }
 
 public actor ReleaseClient {
-    private let catalogURL: URL?
     private let apiDelegate = OfficialRedirectDelegate(.api)
     private let assetDelegate = OfficialRedirectDelegate(.asset)
     private let apiSession: URLSession
     private let assetSession: URLSession
-    public init(catalogURL: URL? = nil) {
-        self.catalogURL = catalogURL
-        let configuration = URLSessionConfiguration.ephemeral
+    public init() {
+        self.init(sessionConfiguration: .ephemeral)
+    }
+
+    /// A session-local URLProtocol can supply deterministic HTTP responses in tests.
+    /// The client still owns both redirect delegates and all response validation.
+    init(sessionConfiguration: URLSessionConfiguration) {
+        let configuration = sessionConfiguration.copy() as! URLSessionConfiguration
         configuration.httpCookieStorage = nil; configuration.urlCache = nil
         configuration.timeoutIntervalForRequest = 30; configuration.timeoutIntervalForResource = 600
         apiSession = URLSession(configuration: configuration, delegate: apiDelegate, delegateQueue: nil)
@@ -79,36 +110,7 @@ public actor ReleaseClient {
 
     public func latest() async throws -> ZashboardRelease {
         let release = try convert(try await request(OfficialRelease.self, suffix: "/latest"))
-        try remember([release]); return release
-    }
-
-    /// Fetch up to 100 stable versions; pre-releases and releases without the exact verified asset are excluded.
-    public func stableReleases() async throws -> [ZashboardRelease] {
-        let records = try await request([OfficialRelease].self, suffix: "?per_page=100")
-        let releases = records.filter { !$0.draft && !$0.prerelease }.compactMap { try? convert($0) }
-            .sorted { $0.publishedAt > $1.publishedAt }
-        try remember(releases); return releases
-    }
-
-    public func catalogForLocalImport() throws -> [ZashboardRelease] {
-        var releases = [ZashboardRelease.offlineSeed]
-        if let catalogURL, FileManager.default.fileExists(atPath: catalogURL.path) {
-            // An interrupted or corrupt cache cannot disable the built-in official offline metadata.
-            let cached = (try? AtomicFile.decode([ZashboardRelease].self, from: catalogURL)) ?? []
-            releases += cached.filter { (try? $0.validate()) != nil }
-        }
-        return Array(Dictionary(releases.map { ($0.sha256, $0) }, uniquingKeysWith: { _, latest in latest }).values)
-    }
-
-    public func identifyLocalZIP(_ zip: URL) throws -> ZashboardRelease {
-        let size = try zip.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
-        guard size > 0, size <= SafeZIPExtractor.Limits.standard.maxArchiveBytes else {
-            throw ZashDockError.verification("ZIP 大小超过限制。")
-        }
-        let digest = try Self.digest(of: zip, maximumBytes: Int64(size))
-        guard let release = try catalogForLocalImport().first(where: { $0.sha256 == digest && $0.assetSize == Int64(size) }) else {
-            throw ZashDockError.verification("此 ZIP 与已验证的官方版本不匹配。请联网检查版本后重试；首次离线导入支持官方 v3.29.1 dist.zip。")
-        }
+        try Task.checkCancellation()
         return release
     }
 
@@ -173,43 +175,71 @@ public actor ReleaseClient {
     }
     private static func hex(_ digest: SHA256.Digest) -> String { digest.map { String(format: "%02x", $0) }.joined() }
 
-    private func remember(_ releases: [ZashboardRelease]) throws {
-        guard let catalogURL else { return }
-        let existing = (try? catalogForLocalImport()) ?? [.offlineSeed]
-        let all = Dictionary((existing + releases).map { ($0.sha256, $0) }, uniquingKeysWith: { _, new in new })
-        try AtomicFile.encode(Array(all.values), to: catalogURL)
-    }
-
     private func request<T: Decodable & Sendable>(_ type: T.Type, suffix: String) async throws -> T {
+        try Task.checkCancellation()
         let url = URL(string: "https://api.github.com/repos/Zephyruso/zashboard/releases" + suffix)!
         var request = URLRequest(url: url)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         request.setValue("ZashDock/1.0", forHTTPHeaderField: "User-Agent")
-        let (bytes, response) = try await apiSession.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-              let finalURL = http.url, apiDelegate.allows(finalURL) else {
-            throw ZashDockError.verification("GitHub 版本检查失败（可能离线或达到 API 速率限制）。")
-        }
-        var data = Data()
-        for try await byte in bytes {
+        do {
+            let (bytes, response) = try await apiSession.bytes(for: request)
             try Task.checkCancellation()
-            guard data.count < 8_388_608 else { throw ZashDockError.verification("版本目录过大。") }
-            data.append(byte)
+            guard let http = response as? HTTPURLResponse else { throw ReleaseCatalogError.invalidResponse }
+            guard let finalURL = http.url, apiDelegate.allows(finalURL) else { throw ReleaseCatalogError.untrustedSource }
+            let now = Date(), retryAt = Self.retryDate(http, now: now)
+            if http.statusCode == 429 || (http.statusCode == 403 &&
+                (http.value(forHTTPHeaderField: "X-RateLimit-Remaining")?.trimmingCharacters(in: .whitespacesAndNewlines) == "0" ||
+                 Self.retryAfter(http, now: now) != nil)) {
+                throw ReleaseCatalogError.rateLimited(status: http.statusCode, retryAt: retryAt)
+            }
+            if (300..<400).contains(http.statusCode) { throw ReleaseCatalogError.untrustedSource }
+            guard http.statusCode == 200 else { throw ReleaseCatalogError.httpStatus(http.statusCode) }
+            let maximum = 8_388_608
+            guard http.expectedContentLength <= maximum else { throw ReleaseCatalogError.responseTooLarge }
+            var data = Data()
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                guard data.count < maximum else { throw ReleaseCatalogError.responseTooLarge }
+                data.append(byte)
+            }
+            try Task.checkCancellation()
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+            do { return try decoder.decode(T.self, from: data) }
+            catch { throw ReleaseCatalogError.invalidJSON }
+        } catch {
+            if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw CancellationError()
+            }
+            throw error
         }
-        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(T.self, from: data)
+    }
+
+    private static func retryAfter(_ response: HTTPURLResponse, now: Date) -> Date? {
+        guard let value = response.value(forHTTPHeaderField: "Retry-After"),
+              let seconds = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)), (0...604_800).contains(seconds) else { return nil }
+        return now.addingTimeInterval(TimeInterval(seconds))
+    }
+    private static func retryDate(_ response: HTTPURLResponse, now: Date) -> Date? {
+        if let date = retryAfter(response, now: now) { return date }
+        guard response.value(forHTTPHeaderField: "X-RateLimit-Remaining")?.trimmingCharacters(in: .whitespacesAndNewlines) == "0",
+              let value = response.value(forHTTPHeaderField: "X-RateLimit-Reset"),
+              let seconds = Int64(value.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        let interval = TimeInterval(seconds)
+        guard interval >= now.timeIntervalSince1970, interval - now.timeIntervalSince1970 <= 604_800 else { return nil }
+        return Date(timeIntervalSince1970: interval)
     }
     private func convert(_ release: OfficialRelease) throws -> ZashboardRelease {
         guard !release.draft, !release.prerelease,
               let asset = release.assets.first(where: { $0.name == "dist.zip" }), asset.state == "uploaded",
               let digest = asset.digest, digest.hasPrefix("sha256:") else {
-            throw ZashDockError.verification("官方稳定版尚未提供带 SHA-256 的 dist.zip。")
+            throw ReleaseCatalogError.invalidMetadata
         }
         let result = ZashboardRelease(tag: release.tag_name, publishedAt: release.published_at,
                                       assetURL: asset.browser_download_url, assetSize: asset.size,
                                       sha256: String(digest.dropFirst(7)))
-        try result.validate(); return result
+        do { try result.validate() } catch { throw ReleaseCatalogError.invalidMetadata }
+        return result
     }
     private struct OfficialRelease: Decodable, Sendable {
         let tag_name: String; let published_at: Date; let draft: Bool; let prerelease: Bool; let assets: [Asset]

@@ -4,9 +4,15 @@ ZashDock 是仅面向 Apple Silicon 的 macOS 原生 Zashboard 容器：从 [Zep
 
 应用采用 SwiftUI、macOS 26 的 WebKit `WebView` / `WebPage`、Swift Concurrency 和 Observation。Swift Package Manager 管理本地 Core 包和 Sparkle，系统 zlib 用于解压。没有 Electron、Tauri、Node.js、Docker 或内置 Mihomo Kernel，也不修改 Surge 或系统代理设置。App Bundle 不包含 Zashboard `dist` 静态资源。
 
-原生安装、版本管理、静态服务、WebKit 持久化、端口事务、更新及回滚界面均已实现。已执行真实 `xcodebuild` 和 Swift Testing；逐项结果及实际限制见 [测试说明](Docs/TESTING.md)。
+原生安装、静态服务、WebKit 持久化、端口事务和更新界面均已实现。已执行真实 `xcodebuild` 和 Swift Testing；逐项结果及实际限制见 [测试说明](Docs/TESTING.md)。
 
-2026-10-23 审计修复已通过 P1、P2 阶段编译与回归，详情见 [修复记录](Docs/REMEDIATION.md)。现已采用“WebKit 日常持久化＋改端口时一次性转移完整业务数据”，移除了持续同步的原生配置副本和相关恢复界面；未发布 Release。
+2026-10-23 审计修复已通过 P1、P2 阶段编译与回归，详情见 [修复记录](Docs/REMEDIATION.md)。现已采用“WebKit 日常持久化＋改端口时一次性转移完整业务数据”，移除了持续同步的原生配置副本和相关恢复界面。
+
+## 首个正式版准备
+
+计划通过 GitHub Releases 直接分发正式版 **`v1.0.0`**，应用内版本为 **`1.0.0 (2)`**，要求 Apple Silicon、macOS 26.0+，不需要上架 App Store。产品版本和 Apple 分发身份分别记录：本次选择正式版发行，使用实际 Release 构建和 **ad hoc 签名**；维护者目前没有 Apple Developer Program 会员，没有 Developer ID 签名、Apple 公证或装订。**Gatekeeper 可能阻止下载后的应用启动**；ad hoc 签名不提供 Apple 验证的开发者身份，也不能保证每台 Mac 上的首次启动体验。相关要求见 [Apple 软件分发说明](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)。
+
+此正式版计划进入稳定 Sparkle Feed，更新包与 Feed 均使用专用 Ed25519 密钥签名；该更新完整性验证独立于 Apple 的 Developer ID 和公证。发行同时提供应用 ZIP、SHA-256、匹配 dSYM 与白名单构建信息；归档检查和对应源码提交的 CI 通过后才发布。功能与验证边界见 [v1.0.0 发行说明](https://github.com/MiracleHYH/ZashDock/blob/main/Docs/RELEASE-NOTES-1.0.0.md)。实际可用版本以仓库 [Releases](https://github.com/MiracleHYH/ZashDock/releases) 为准。
 
 ## 构建与运行
 
@@ -28,7 +34,7 @@ xcodebuild -project ZashDock.xcodeproj \
   CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES build
 ```
 
-产物位于 `build/Xcode/Build/Products/Debug/ZashDock.app`。上述签名是供本机开发使用的 ad hoc 签名，发布签名和公证需要自己的开发者身份。
+产物位于 `build/Xcode/Build/Products/Debug/ZashDock.app`。上述命令生成供本机开发使用的 ad hoc Debug 构建。GitHub 正式版可显式选择 ad hoc Release 模式；Developer ID 签名与 Apple 公证另需相应开发者身份。
 
 仓库也提供 SwiftPM 辅助命令：
 
@@ -55,16 +61,11 @@ xcodebuild -project ZashDock.xcodeproj \
 
 ## 首次安装
 
-没有有效安装时，主窗口显示原生安装页面。点击“安装最新稳定版”后，应用从官方 GitHub API 获取稳定发行信息，下载精确的 `dist.zip` 资产，显示进度并支持取消。通过 HTTPS 来源、资产大小、SHA-256 和 ZIP 安全检查后，候选版本还须在 WebKit 中正常加载，才会成为当前版本。失败可重试；安装损坏时提供修复入口。
+没有有效安装时，主窗口显示原生安装页面。“下载并安装”从官方 GitHub API 获取最新稳定发行信息，下载精确的 `dist.zip` 资产，显示进度并支持取消。在线下载仍核验 HTTPS 来源、资产大小及官方 SHA-256。候选网页正常加载后才成为当前安装；失败可重试，安装损坏时提供修复入口。
 
-无法在线下载时，可通过“从本地官方 ZIP 导入…”选择已下载的官方资产。首次完全离线导入支持 [v3.29.1 的官方 dist.zip](https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist.zip)：
+右侧导入图标可选择本地 ZIP，适用于离线或 GitHub 受限环境。导入不联网、不验证官方身份、不要求匹配已知版本或官方摘要，来源由用户自行判断。应用保留 ZIP 路径、结构、解压限额和必要文件检查，并确认页面能够加载；本地计算的摘要仅用于安装后的内部完整性记录。导入安装在 Settings 显示为“本地导入（版本未知）”，不从文件名猜测 Zashboard 版本。
 
-```text
-大小：9,570,334 字节
-SHA-256：4f16cce229e223bd07b5a3daccfbfb8bf349d7335572d412959284ab6c9bab50
-```
-
-应用只内置上述发行的来源、大小及摘要元数据，不捆绑 ZIP 或网页资源。联网获取过可信发行元数据后，也可离线导入与缓存摘要匹配的版本。未知 ZIP 不会仅凭文件名或目录结构被视为官方安装包。完整上游核验记录见 [UPSTREAM.md](Docs/UPSTREAM.md)。
+GitHub 匿名 API 的额度按网络出口共享，使用同一代理出口的其他请求也会占用额度。出现限流时，应用显示 HTTP 状态及响应中可用的重试时间；可以等待后重试，或使用右侧图标导入本地 ZIP。
 
 ## 连接 Remote 与端口设置
 
@@ -91,15 +92,17 @@ external-controller-cors:
 
 改端口时，`OriginStorageTransfer` 一次性转移完整 LocalStorage，以及已核验的官方 `base64`、`connection-history` 两个 IndexedDB，包含 Remote、选中后端、设置、本地背景图和连接历史。数据只暂存在内存；目标数据在官方网页初始化前已写入。未知数据库或结构、超限、取消和验证失败都会中止提交并保留源数据。这里的“完整”指当前官方版本的业务数据，不包含 Cookie、sessionStorage、Service Worker 和可重新生成的缓存。
 
-原生设置文件只记录端口、历史版本数量、窗口行为及清理标记。端口提交成功后才清理旧 Origin；若中断，重启会根据已提交端口继续工作并重试旧数据清理。普通设置损坏时先保全原文件，再显式恢复原端口，避免误把其他 Origin 当成空配置。
+原生设置文件只记录端口、窗口行为及兼容和清理标记。端口提交成功后才清理旧 Origin；若中断，重启会根据已提交端口继续工作并重试旧数据清理。普通设置损坏时先保全原文件，再显式恢复原端口，避免误把其他 Origin 当成空配置。
 
 从早期开发版升级时，`LegacyWebStorageReader` 可只读认证原密文并完成一次导入。成功标记后不再读取旧密文或访问其 Keychain 项；原文件不会被修改或删除。旧密钥暂不可读时保留文件并允许重试，不生成替代密钥。全新安装不使用此兼容路径。Bundle ID 固定为 `app.zashdock.mac`，请保持应用身份稳定。
 
-## 更新与回滚契约
+## 更新与当前安装
 
-在原生 **设置 → 更新** 中检查稳定版、安装最新或历史稳定版、导入官方 ZIP、查看本地历史并手动回滚。`ZashboardUpdateManager` 独立处理官方来源和下载；候选先使用临时 WebKit 存储验证实际网页及本地服务版本，通过后才提交版本指针，再加载日常持久 profile。候选失败或取消不会清空当前配置。若提交后的持久页面加载失败，保留已提交版本与历史资源，显示重新载入入口；只有持久页面成功加载后才执行历史清理。
+从系统菜单栏 **ZashDock → 设置…** 或 **⌘,** 打开原生设置窗口。主窗口不放右上角设置或版本控件。**设置 → 更新** 和 **关于** 页均同时显示明确标注的 ZashDock 完整版本（含构建号）与 Zashboard 版本；系统菜单 **关于 ZashDock** 的原生面板也同时显示两者。更新页另提供 Zashboard 最新稳定版和安装入口。
 
-保留参数 `maxRollbackVersions = N` 默认 **1**，允许 **0**；N 仅计算历史版本，不包含当前版本。成功操作完成后的版本数量上限为 **N + 1**。首次安装只有当前版本，失败或未激活候选不属于历史。历史按最近激活顺序保留；回滚目标成为当前版本，原当前版本进入历史，同样应用上限。清理只在候选验证与提交成功后执行，不删除正在使用的版本或网页业务数据。
+应用只保留当前安装，不提供 Zashboard 回滚、历史下载列表或历史保留数。候选先使用临时 WebKit 存储验证实际网页及本地服务版本，通过后才提交当前指针，再加载日常持久 profile。候选失败或取消时原安装和网页数据保留；成功加载后清理旧资源。旧版已有历史目录在当前安装确认可用后清理，用户的 Remote、设置及背景/历史数据库独立保留。
+
+若指针提交后的持久页面加载失败，保留已提交安装与暂未清理的原资源，显示重载入口。这是失败恢复的临时资源保全，未向用户提供版本回滚功能。
 
 本地面板更新由原生安装器直接处理官方 Releases，不能通过 Mihomo `/upgrade/ui` 更新 ZashDock 的网页目录。版本切换处理 loopback 的 Service Worker 和可丢弃缓存，不全量清空 WebsiteDataStore，不删除 LocalStorage 或 IndexedDB。
 
@@ -109,9 +112,9 @@ external-controller-cors:
 
 ZashDock 使用 MIT License；App 资源内保留本项目及 Sparkle 的完整许可文本，包含 Sparkle 所用组件的通知，“关于”页也提供许可链接。
 
-应用固定使用 `main/appcast.xml` 的 HTTPS 更新源，并要求更新源及更新包的 Ed25519 签名有效。公钥随应用发布，专用私钥不提交源码；签名失败不会在一段时间后自动回退为无签名 Feed。首次推送只提供签名的空更新源，不包含发布包或虚构版本。
+应用固定使用 `main/appcast.xml` 的 HTTPS 更新源，并要求更新源及更新包的 Ed25519 签名有效。公钥随应用发布，专用私钥不提交源码；签名失败不会在一段时间后自动回退为无签名 Feed。首次源码推送提供了签名的空更新源；`v1.0.0` 正式版计划在发行验证完成后将签名条目写入稳定 Feed。
 
-推送和 Pull Request 只触发构建、测试和 Debug 工件上传。正式发布须手动运行 `Publish signed ZashDock` 工作流并输入 `PUBLISH`，经过 Developer ID 签名、Apple 公证、装订和 Sparkle 签名后，才创建 GitHub Release 并更新 Feed。所需证书、仓库配置和失败恢复步骤见 [发布说明](Docs/RELEASING.md)。首次源码推送不会创建 Tag 或 Release。
+推送和 Pull Request 只触发构建、测试和 Debug 工件上传。正式发布须手动运行 `Publish signed ZashDock` 工作流并输入 `PUBLISH`，通过 `signing_mode` 显式选择 Apple 分发模式：默认 `developer-id` 要求 Developer ID 签名、公证和装订；本次选择 `adhoc`，明确保留未公证限制。两种模式均要求 Sparkle 对更新包和 Feed 签名并独立验证，成功后才创建正式 GitHub Release 并更新 Feed；缺少所选模式的必需凭据时停止，不隐式切换模式。正式版使用 Build `2`，供此前 Build `1` 的试用安装识别更新；后续发行 Build 必须大于 `2` 并持续递增。所需配置和失败恢复步骤见 [发布说明](Docs/RELEASING.md)。
 
 ## 进一步阅读
 

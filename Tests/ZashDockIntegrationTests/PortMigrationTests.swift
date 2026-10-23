@@ -196,7 +196,7 @@ struct PortMigrationTests {
       let fields = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
       #expect(
         Set(fields.keys).isSubset(of: [
-          "port", "maxRollbackVersions", "quitAfterLastWindowCloses", "pendingOriginCleanup",
+          "port", "quitAfterLastWindowCloses", "pendingOriginCleanup",
           "legacyStorageImported",
         ]))
       #expect(data.range(of: Data("port-fixture-secret-one".utf8)) == nil)

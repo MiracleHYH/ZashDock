@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import CryptoKit
 import Testing
 import WebKit
 @testable import ZashDock
@@ -66,19 +67,18 @@ struct OfficialDistributionTests {
             #expect(model.errorMessage == nil)
             let store = try #require(model.store)
             #expect(try await store.current() == nil)
-            #expect(try await store.history().isEmpty)
             #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.versions.path).isEmpty)
             #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.staging.path).isEmpty)
             #expect(!FileManager.default.fileExists(atPath: fixture.paths.root.appendingPathComponent("storage.aesgcm").path))
 
             // Retry through the same AppModel entry point used by the native import button. This
-            // authenticates and extracts the real ZIP, loads official JavaScript, then commits it.
+            // validates and extracts the real ZIP, loads official JavaScript, then commits it.
             model.install(zip: archive)
             let retryOperation = try #require(model.operation)
             await retryOperation.value
             #expect(model.phase == .ready)
-            #expect(model.currentVersion?.tag == "v3.29.1")
-            #expect(model.currentVersion?.sha256 == ZashboardRelease.offlineSeed.sha256)
+            #expect(model.currentVersion?.tag == "本地导入" && model.currentVersion?.source == .localArchive)
+            #expect(model.currentVersion?.sha256 == officialV3291FixtureRelease.sha256)
             #expect(try await store.current() == model.currentVersion)
             #expect(model.configuration.port == configuration.port)
             #expect(model.operation == nil)
@@ -125,10 +125,10 @@ struct OfficialDistributionTests {
         do {
             try fixture.paths.createDirectories()
             let store = try VersionStore(root: root)
-            // This exercises the real bounded copy, exact official digest, ZIP parser and manifest checks.
-            let version = try await store.prepare(zip: archive, release: .offlineSeed)
-            #expect(version.tag == "v3.29.1")
-            #expect(version.sha256 == ZashboardRelease.offlineSeed.sha256)
+            // This exercises the real bounded copy, ZIP parser and manifest checks for a local archive.
+            let version = try await store.prepareLocalZIP(archive)
+            #expect(version.tag == "本地导入" && version.source == .localArchive)
+            #expect(version.sha256 == officialV3291FixtureRelease.sha256)
             try await store.activate(version)
 
             // Reserve a genuinely bound random port before saving it; do not guess that a port is free.
@@ -232,8 +232,8 @@ struct OfficialDistributionTests {
 
     private func assertOfficialState(_ model: AppModel, expected: [String: String]) async throws {
         #expect(model.phase == .ready)
-        #expect(model.currentVersion?.tag == "v3.29.1")
-        #expect(model.currentVersion?.sha256 == ZashboardRelease.offlineSeed.sha256)
+        #expect(model.currentVersion?.tag == "本地导入" && model.currentVersion?.source == .localArchive)
+        #expect(model.currentVersion?.sha256 == officialV3291FixtureRelease.sha256)
         #expect(model.errorMessage == nil)
         let session = try #require(model.session)
         let value = try await session.page.callJavaScript("""

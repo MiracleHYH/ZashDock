@@ -77,7 +77,7 @@ struct VersionLifecycleTests {
       sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
     return try await store.prepare(zip: zip, release: release)
   }
-  private func makeFixture(maxHistory: Int) async throws -> PortMigrationFixture {
+  private func makeFixture() async throws -> PortMigrationFixture {
     _ = NSApplication.shared
     let paths = AppPaths(
       root: FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -90,7 +90,6 @@ struct VersionLifecycleTests {
       let listener = try await bindFixture(current.directoryURL)
       var configuration = AppConfiguration()
       configuration.port = listener.port
-      configuration.maxRollbackVersions = maxHistory
       listener.stop()
       try ConfigurationStore(url: paths.configuration).save(configuration)
       return PortMigrationFixture(paths: paths, webRoot: current.directoryURL)
@@ -100,9 +99,9 @@ struct VersionLifecycleTests {
     }
   }
   private func withFixture(
-    maxHistory: Int = 1, body: (PortMigrationFixture, AppModel) async throws -> Void
+    body: (PortMigrationFixture, AppModel) async throws -> Void
   ) async throws {
-    let fixture = try await makeFixture(maxHistory: maxHistory)
+    let fixture = try await makeFixture()
     let model = fixture.model()
     await model.start()
     do {
@@ -121,147 +120,155 @@ struct VersionLifecycleTests {
     }.count
   }
 
+  private func localArchive(_ paths: AppPaths, marker: String, rendered: Bool = true) throws -> URL {
+    let url = paths.root.appendingPathComponent("custom-panel-\(UUID()).zip")
+    try archive(marker: marker, rendered: rendered).write(to: url)
+    return url
+  }
+  private func install(_ zip: URL, into model: AppModel) async throws {
+    model.install(zip: zip)
+    let operation = try #require(model.operation)
+    await operation.value
+    #expect(model.operation == nil && !model.isBusy)
+    if let paths = model.paths { #expect(try FileManager.default.contentsOfDirectory(atPath: paths.staging.path).isEmpty) }
+  }
+
   @Test(.timeLimit(.minutes(1)))
-  func updateAndRollbackAtSameOriginRenderCorrectVersionAndKeepOfficialRemotes() async throws {
+  func firstInstallationAcceptsAnUnknownLocalZIPWithoutReleaseMetadata() async throws {
+    _ = NSApplication.shared
+    let paths = AppPaths(root: FileManager.default.temporaryDirectory.appendingPathComponent("ZashDockLocalFirstInstall-\(UUID())"))
+    try paths.createDirectories()
+    let probe = paths.root.appendingPathComponent("port-probe", isDirectory: true)
+    try FileManager.default.createDirectory(at: probe, withIntermediateDirectories: false)
+    try Data("<div id='app'>Port reservation</div>".utf8).write(to: probe.appendingPathComponent("index.html"))
+    let reservation = try await bindFixture(probe)
+    var configuration = AppConfiguration(); configuration.port = reservation.port
+    reservation.stop(); try ConfigurationStore(url: paths.configuration).save(configuration)
+    let fixture = PortMigrationFixture(paths: paths, webRoot: probe)
+    do {
+      let model = fixture.model(); await model.start()
+      #expect(model.phase == .uninstalled && model.currentVersion == nil && model.session == nil)
+      let zip = try localArchive(paths, marker: "first-local-version")
+      try await install(zip, into: model)
+      #expect(model.phase == .ready && model.currentVersion?.source == .localArchive)
+      #expect(model.currentVersion?.tag == "本地导入" && model.errorMessage == nil)
+      #expect(!FileManager.default.fileExists(atPath: paths.root.appendingPathComponent("official-releases.json").path))
+      #expect(try directoryCount(paths) == 1)
+      #expect(try await model.session?.page.callJavaScript("return window.fixtureVersion;") as? String == "first-local-version")
+      await fixture.cleanUp()
+    } catch { await fixture.cleanUp(); throw error }
+  }
+
+  @Test(.timeLimit(.minutes(1)))
+  func arbitraryLocalZIPInstallsOfflineAndRemovesPreviousResourcesWithoutLosingBusinessData() async throws {
     try await withFixture { fixture, model in
-      #expect(model.phase == .ready)
       let oldVersion = try #require(model.currentVersion)
       let oldPort = model.configuration.port
       let expected = try officialStorage()
       try await writeStorage(model, values: expected)
-      let store = try #require(model.store)
-      let newer = try await prepare(
-        store, paths: fixture.paths, tag: "v0.6.1", marker: "version-new")
-      try await model.switchVersion(newer)
-      #expect(model.currentVersion == newer)
-      #expect(model.configuration.port == oldPort)
-      #expect(model.session?.origin.port == Int(oldPort))
-      #expect(model.history.map(\.id) == [oldVersion.id])
-      try await assertPage(model, marker: "version-new", storage: expected)
-      #expect(try await store.current() == newer)
-      try await model.switchVersion(oldVersion)
-      #expect(model.currentVersion == oldVersion)
-      #expect(model.configuration.port == oldPort)
-      #expect(model.history.map(\.id) == [newer.id])
-      #expect(try directoryCount(fixture.paths) == 2)
-      try await assertPage(model, marker: "version-initial", storage: expected)
-      #expect(try await store.current() == oldVersion)
+      let zip = try localArchive(fixture.paths, marker: "custom-offline-version")
+      // Local import must not read an official-release catalogue or identify a known digest.
+      try Data("{invalid catalogue must not be read".utf8).write(to: fixture.paths.root.appendingPathComponent("official-releases.json"))
+      let digest = SHA256.hash(data: try Data(contentsOf: zip)).map { String(format: "%02x", $0) }.joined()
+      try await install(zip, into: model)
+      let current = try #require(model.currentVersion)
+      #expect(current.source == .localArchive && current.tag == "本地导入" && current.sha256 == digest)
+      #expect(current.id != oldVersion.id)
+      #expect(model.errorMessage == nil && model.configuration.port == oldPort)
+      #expect(!FileManager.default.fileExists(atPath: oldVersion.directoryURL.path))
+      #expect(try directoryCount(fixture.paths) == 1)
+      try await assertPage(model, marker: "custom-offline-version", storage: expected)
+      #expect(try await model.store?.current() == current)
+      await fixture.shutdown(model)
+      let reopened = fixture.model(); await reopened.start()
+      #expect(reopened.currentVersion == current && reopened.configuration.port == oldPort)
+      try await assertPage(reopened, marker: "custom-offline-version", storage: expected)
     }
   }
 
-  @Test(.timeLimit(.minutes(1)), arguments: [0, 1, 3])
-  func successfulVersionTransactionsEnforceCurrentPlusNHistory(maxHistory: Int) async throws {
-    try await withFixture(maxHistory: maxHistory) { fixture, model in
-      #expect(model.phase == .ready)
-      let store = try #require(model.store)
+  @Test(.timeLimit(.minutes(1)))
+  func eachSuccessfulLocalUpdateKeepsOnlyCurrentResources() async throws {
+    try await withFixture { fixture, model in
       let expected = try officialStorage()
       try await writeStorage(model, values: expected)
       let port = model.configuration.port
-      var markers = [try #require(model.currentVersion).id: "version-initial"]
-      for number in 1...5 {
-        let marker = "retention-\(number)"
-        let candidate = try await prepare(
-          store, paths: fixture.paths, tag: "v0.7.\(number)", marker: marker)
-        markers[candidate.id] = marker
-        try await model.switchVersion(candidate)
-        #expect(model.currentVersion == candidate)
-        #expect(model.configuration.port == port)
-        #expect(model.history.count == min(number, maxHistory))
-        #expect(model.history.count + 1 <= maxHistory + 1)
-        #expect(try directoryCount(fixture.paths) == min(number + 1, maxHistory + 1))
-        #expect(try await store.history().map(\.id) == model.history.map(\.id))
+      for number in 1...3 {
+        let oldVersion = try #require(model.currentVersion)
+        let marker = "single-current-\(number)"
+        try await install(localArchive(fixture.paths, marker: marker), into: model)
+        let current = try #require(model.currentVersion)
+        #expect(current.source == .localArchive && current.id != oldVersion.id)
+        #expect(model.configuration.port == port && model.errorMessage == nil)
+        #expect(!FileManager.default.fileExists(atPath: oldVersion.directoryURL.path))
+        #expect(try directoryCount(fixture.paths) == 1)
+        #expect(try await model.store?.current() == current)
         try await assertPage(model, marker: marker, storage: expected)
-      }
-      if maxHistory > 0 {
-        let previousCurrent = try #require(model.currentVersion)
-        let rollback = try #require(model.history.last)
-        try await model.switchVersion(rollback)
-        #expect(model.currentVersion == rollback)
-        #expect(model.history.first?.id == previousCurrent.id)
-        #expect(model.history.count == maxHistory)
-        #expect(try directoryCount(fixture.paths) == maxHistory + 1)
-        try await assertPage(model, marker: try #require(markers[rollback.id]), storage: expected)
-      } else {
-        #expect(model.history.isEmpty)
       }
     }
   }
 
   @Test(.timeLimit(.minutes(1)))
-  func unrenderedCandidateFailsAndRestoresPriorVersionWithoutCommitting() async throws {
+  func unrenderedLocalCandidateFailsWithoutCommittingOrDeletingWorkingResources() async throws {
     try await withFixture { fixture, model in
-      #expect(model.phase == .ready)
-      let store = try #require(model.store)
+      let original = try #require(model.currentVersion)
       let expected = try officialStorage()
       try await writeStorage(model, values: expected)
-      // Establish a real historical version so failure must preserve the full activation order.
-      let good = try await prepare(store, paths: fixture.paths, tag: "v0.8.1", marker: "known-good")
-      try await model.switchVersion(good)
-      let originalPort = model.configuration.port
-      let originalHistory = model.history
       let pointer = fixture.paths.root.appendingPathComponent("versions-state.json")
       let pointerBytes = try Data(contentsOf: pointer)
       let configBytes = try Data(contentsOf: fixture.paths.configuration)
-      let broken = try await prepare(
-        store, paths: fixture.paths, tag: "v0.8.2", marker: "never-rendered", rendered: false)
-      let failing = Task { try await model.switchVersion(broken) }
-      defer { failing.cancel() }
-      while !model.isBusy { await Task.yield() }
-      await #expect(throws: (any Error).self) { try await model.switchVersion(good) }
-      await #expect(throws: (any Error).self) { try await failing.value }
-      #expect(model.phase == .ready)
-      #expect(!model.isBusy)
-      #expect(model.currentVersion == good)
-      #expect(model.configuration.port == originalPort)
-      #expect(model.server?.port == originalPort)
-      #expect(model.history == originalHistory)
-      #expect(try await store.current() == good)
-      #expect(try await store.history() == originalHistory)
+      try await install(localArchive(fixture.paths, marker: "never-rendered", rendered: false), into: model)
+      #expect(model.phase == .ready && model.currentVersion == original)
+      #expect(model.errorMessage != nil)
+      #expect(try await model.store?.current() == original)
       #expect(try Data(contentsOf: pointer) == pointerBytes)
       #expect(try Data(contentsOf: fixture.paths.configuration) == configBytes)
-      try await assertPage(model, marker: "known-good", storage: expected)
-      try await store.discardPrepared(broken)
-      #expect(try directoryCount(fixture.paths) == originalHistory.count + 1)
+      #expect(try directoryCount(fixture.paths) == 1)
+      #expect(FileManager.default.fileExists(atPath: original.directoryURL.path))
+      try await assertPage(model, marker: "version-initial", storage: expected)
     }
   }
 
   @Test(.timeLimit(.minutes(1)))
-  func cancelledCandidateVerificationStillRestoresWorkingVersionAndWebKitData() async throws {
+  func cancelledLocalCandidateKeepsWorkingResourcesAndLatestWebKitData() async throws {
     try await withFixture { fixture, model in
-      #expect(model.phase == .ready)
-      let store = try #require(model.store)
+      let original = try #require(model.currentVersion)
       let expected = try officialStorage()
       try await writeStorage(model, values: expected)
-      let good = try await prepare(
-        store, paths: fixture.paths, tag: "v0.9.1", marker: "cancel-safe-version")
-      try await model.switchVersion(good)
-      let oldPort = model.configuration.port
-      let oldHistory = model.history
       let pointer = fixture.paths.root.appendingPathComponent("versions-state.json")
       let originalPointer = try Data(contentsOf: pointer)
-      let broken = try await prepare(
-        store, paths: fixture.paths, tag: "v0.9.2", marker: "cancelled-candidate", rendered: false)
-      let switching = Task { try await model.switchVersion(broken) }
-      defer { switching.cancel() }
-      while !model.isBusy { await Task.yield() }
+      model.install(zip: try localArchive(fixture.paths, marker: "cancelled-candidate", rendered: false))
+      let operation = try #require(model.operation)
       try await Task.sleep(for: .seconds(2))
       #expect(model.isBusy)
-      switching.cancel()
-      await #expect(throws: (any Error).self) { try await switching.value }
-      #expect(switching.isCancelled)
+      model.cancel(); await operation.value
+      #expect(operation.isCancelled && model.operation == nil && !model.isBusy)
       #expect(model.phase == .ready)
-      #expect(!model.isBusy)
-      #expect(model.currentVersion == good)
-      #expect(model.configuration.port == oldPort)
-      #expect(model.server?.port == oldPort)
-      #expect(model.server?.versionID == good.id)
-      #expect(model.history == oldHistory)
-      #expect(try await store.current() == good)
-      #expect(try await store.history() == oldHistory)
+      #expect(model.currentVersion == original)
+      #expect(model.errorMessage == nil)
+      #expect(model.server?.versionID == original.id)
+      #expect(try await model.store?.current() == original)
       #expect(try Data(contentsOf: pointer) == originalPointer)
-      try await assertPage(model, marker: "cancel-safe-version", storage: expected)
-      try await store.discardPrepared(broken)
-      #expect(try directoryCount(fixture.paths) == oldHistory.count + 1)
+      #expect(try directoryCount(fixture.paths) == 1)
+      try await assertPage(model, marker: "version-initial", storage: expected)
+    }
+  }
+
+  @Test(.timeLimit(.minutes(1)))
+  func corruptLocalArchiveCanBeRetriedWithAnyValidOfflineZIP() async throws {
+    try await withFixture { fixture, model in
+      let original = try #require(model.currentVersion)
+      let expected = try officialStorage()
+      try await writeStorage(model, values: expected)
+      let bad = fixture.paths.root.appendingPathComponent("damaged.zip")
+      try Data("not a ZIP".utf8).write(to: bad)
+      try await install(bad, into: model)
+      #expect(model.currentVersion == original && model.phase == .ready && model.errorMessage != nil)
+      #expect(FileManager.default.fileExists(atPath: original.directoryURL.path))
+      try await model.originStorage.verify(expected, at: try #require(model.session).origin)
+      try await install(localArchive(fixture.paths, marker: "offline-retry"), into: model)
+      #expect(model.currentVersion?.source == .localArchive && model.errorMessage == nil)
+      #expect(try directoryCount(fixture.paths) == 1)
+      try await assertPage(model, marker: "offline-retry", storage: expected)
     }
   }
 

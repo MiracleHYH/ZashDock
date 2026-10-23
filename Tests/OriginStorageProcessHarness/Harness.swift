@@ -118,7 +118,10 @@ private final class HarnessDelegate: NSObject, NSApplicationDelegate {
             try await WKWebsiteDataStore.remove(forIdentifier: identity.profile)
             NSApp.terminate(nil); return
         }
-        var metadata = try JSONDecoder().decode(PortMetadata.self, from: Data(contentsOf: metadataURL))
+        let metadataData = try Data(contentsOf: metadataURL)
+        let fields = try JSONSerialization.jsonObject(with: metadataData) as? [String: Any]
+        guard let fields, Set(fields.keys).isSubset(of: ["currentPort", "pendingOriginCleanup"]) else { throw HarnessFailure.fixtureMismatch }
+        var metadata = try JSONDecoder().decode(PortMetadata.self, from: metadataData)
         if arguments.contains("--expect-old"), metadata.currentPort != identity.oldPort { throw HarnessFailure.fixtureMismatch }
         if arguments.contains("--expect-new"), metadata.currentPort != identity.newPort { throw HarnessFailure.fixtureMismatch }
         let dataStore = WKWebsiteDataStore(forIdentifier: identity.profile)

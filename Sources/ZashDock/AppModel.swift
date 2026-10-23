@@ -15,7 +15,6 @@ final class AppModel {
     var currentVersion: InstalledVersion?
     var session: WebSession?
     var updater: ZashboardUpdateManager?
-    var history: [InstalledVersion] = []
     var isBusy = false
     var settingsVisible = false
     @ObservationIgnored let dataStore: WKWebsiteDataStore
@@ -37,6 +36,10 @@ final class AppModel {
     }
     var recoverableOriginPort: UInt16? { configurationStore?.recoverableConfiguration()?.port }
     var canManageVersions: Bool { updater != nil && !legacyImportFailed && startupIssue == nil }
+    var zashboardVersionDescription: String {
+        guard let currentVersion else { return "尚未安装" }
+        return currentVersion.source == .localArchive ? "本地导入（版本未知）" : currentVersion.tag
+    }
     private func origin(_ port: UInt16) -> URL { URL(string: "http://127.0.0.1:\(port)")! }
 
     func start() async {
@@ -46,27 +49,23 @@ final class AppModel {
     func retryStartup() async {
         guard !isBusy, operation == nil, session == nil else { return }
         didStart = true
-        await initializeStartup(pruningAllowed: false)
+        await initializeStartup()
     }
     func resetConfigurationAndRestart(preservingPort: UInt16? = nil) async {
-        guard !isBusy, operation == nil, startupIssue != nil, let configurationStore, let paths else { return }
+        guard !isBusy, operation == nil, startupIssue != nil, let configurationStore else { return }
         isBusy = true
         do {
-            let entries = try FileManager.default.contentsOfDirectory(at: paths.versions, includingPropertiesForKeys: [.isDirectoryKey])
-            let count = try entries.filter { try $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true }.count
-            guard count <= 101 else { throw ZashDockError.invalidConfiguration("现有版本目录超过安全保留上限；请修复原设置后重新读取。") }
-            var defaults = AppConfiguration(); defaults.maxRollbackVersions = max(1, count - 1)
-            configurationRecoveryBackup = try configurationStore.resetToDefaultsPreservingOriginal(defaults, preservingPort: preservingPort)
+            configurationRecoveryBackup = try configurationStore.resetToDefaultsPreservingOriginal(preservingPort: preservingPort)
         } catch { isBusy = false; errorMessage = error.localizedDescription; return }
         isBusy = false
-        await initializeStartup(pruningAllowed: false)
+        await initializeStartup()
     }
-    private func initializeStartup(pruningAllowed: Bool = true) async {
+    private func initializeStartup() async {
         isBusy = true
         defer { isBusy = false }
         startupIssue = nil; errorMessage = nil; legacyImportFailed = false
         phase = .starting; status = "正在检查本地安装…"
-        currentVersion = nil; updater = nil; store = nil; history = []
+        currentVersion = nil; updater = nil; store = nil
         do {
             let paths = try suppliedPaths ?? AppPaths.application()
             try paths.createDirectories(); self.paths = paths
@@ -79,17 +78,14 @@ final class AppModel {
                 throw issue
             }
             let store = try VersionStore(root: paths.root); self.store = store
-            updater = ZashboardUpdateManager(store: store, client: ReleaseClient(catalogURL: paths.root.appendingPathComponent("official-releases.json")), downloadDirectory: paths.staging)
+            updater = ZashboardUpdateManager(store: store, client: ReleaseClient(), downloadDirectory: paths.staging)
             do { currentVersion = try await store.current() }
             catch { phase = .damaged; throw error }
             try await importLegacyStorageIfNeeded()
-            guard let currentVersion else { phase = .uninstalled; status = "首次使用需要安装官方网页资源。"; return }
+            guard let currentVersion else { phase = .uninstalled; status = ""; return }
             try await show(currentVersion)
-            if pruningAllowed {
-                do { try await store.prune(maxHistory: configuration.maxRollbackVersions) }
-                catch { status = "当前版本可用；历史清理将在下次启动时重试。" }
-            }
-            history = try await store.history()
+            do { try await store.removeInactiveVersions() }
+            catch { status = "当前版本可用；旧资源清理将在下次启动时重试。" }
             await retryPendingCleanup()
         } catch {
             if phase != .damaged, phase != .configurationRecovery { phase = .unavailable }
@@ -122,7 +118,7 @@ final class AppModel {
 
     func install(zip: URL? = nil, release: ZashboardRelease? = nil) {
         guard !isBusy, operation == nil, !legacyImportFailed, let updater else { return }
-        isBusy = true
+        isBusy = true; errorMessage = nil
         let previousPhase = phase
         if phase != .ready { phase = .installing }
         operation = Task {
@@ -140,7 +136,7 @@ final class AppModel {
             } catch {
                 if let candidate { try? await store?.discardPrepared(candidate) }
                 if phase == .installing { phase = previousPhase }
-                if !(error is CancellationError) { errorMessage = error.localizedDescription }
+                if !(error is CancellationError), !Task.isCancelled { errorMessage = error.localizedDescription }
             }
         }
     }
@@ -156,27 +152,13 @@ final class AppModel {
         isBusy = true
         operation = Task {
             defer { isBusy = false; operation = nil }
-            do { try Task.checkCancellation(); try await updater.checkForUpdates(); history = try await updater.store.history() }
+            do { try Task.checkCancellation(); try await updater.checkForUpdates() }
             catch {
                 if error is CancellationError || Task.isCancelled { status = "已取消检查更新。" }
                 else { errorMessage = error.localizedDescription }
             }
         }
     }
-    func rollback(_ version: InstalledVersion) {
-        guard !isBusy, operation == nil, !legacyImportFailed else { return }
-        operation = Task {
-            defer { operation = nil }
-            do { try await switchVersion(version) }
-            catch { if !(error is CancellationError) { errorMessage = error.localizedDescription } }
-        }
-    }
-    func switchVersion(_ version: InstalledVersion) async throws {
-        guard !isBusy, !legacyImportFailed else { throw ZashDockError.invalidConfiguration("另一个操作正在进行，或旧版配置尚待导入。") }
-        isBusy = true; defer { isBusy = false }
-        try await activateVersion(version)
-    }
-
     /// Candidate code first runs against a disposable WebKit store. A bad or cancelled
     /// candidate cannot clear the active profile. There is only one HTTP listener throughout.
     private func activateVersion(_ version: InstalledVersion) async throws {
@@ -188,7 +170,7 @@ final class AppModel {
         var candidate: WebSession?
         do {
             let values = try await originStorage.read(origin: origin(configuration.port))
-            status = "正在验证 \(version.tag)…"; phase = .installing
+            status = "正在载入 Zashboard…"; phase = .installing
             let service = try LoopbackHTTPServer(root: version.directoryURL, port: configuration.port, versionID: version.id)
             listener = service; _ = try await service.start()
             let validationStore = WKWebsiteDataStore.nonPersistent()
@@ -212,14 +194,13 @@ final class AppModel {
                     attachSessionFailure(live); session = live
                     try await live.loadAndVerify()
                     phase = .ready
-                    try await updater.commit(version: version, maxHistory: configuration.maxRollbackVersions)
+                    try await updater.commit(version: version)
                     status = updater.status
                 } catch {
                     phase = .unavailable
-                    status = "已验证并启用 \(version.tag)；网页需要重新载入，历史资源仍保留。"
+                    status = "已验证并启用 \(version.tag)；网页需要重新载入，原资源暂时保留。"
                     errorMessage = error.localizedDescription
                 }
-                history = (try? await store.history()) ?? []
             }.value
         } catch {
             await candidate?.suspend(); listener?.stop()
@@ -231,19 +212,6 @@ final class AppModel {
                 }.value
             } else { phase = previousPhase == .installing ? .uninstalled : previousPhase }
             throw error
-        }
-    }
-    func setRetention(_ count: Int) {
-        guard !isBusy, startupIssue == nil, let configurationStore, let store else { return }
-        isBusy = true
-        operation = Task {
-            defer { isBusy = false; operation = nil }
-            do {
-                var proposed = configuration; proposed.maxRollbackVersions = count
-                try configurationStore.save(proposed); configuration = proposed
-                try await store.prune(maxHistory: count, protecting: Set([server?.versionID].compactMap { $0 }))
-                history = try await store.history()
-            } catch { errorMessage = error.localizedDescription }
         }
     }
     func reload() { retryStart() }
@@ -359,7 +327,7 @@ final class AppModel {
             defer { isBusy = false; operation = nil }
             do {
                 errorMessage = nil
-                if legacyImportFailed || currentVersion == nil { await initializeStartup(pruningAllowed: false) }
+                if legacyImportFailed || currentVersion == nil { await initializeStartup() }
                 else if let currentVersion { try await show(currentVersion); await retryPendingCleanup() }
             } catch { phase = .unavailable; errorMessage = error.localizedDescription }
         }

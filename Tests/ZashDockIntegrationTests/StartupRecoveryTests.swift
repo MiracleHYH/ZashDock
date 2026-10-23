@@ -30,11 +30,11 @@ struct StartupRecoveryTests {
             #expect(model.phase == .configurationRecovery)
             #expect(model.startupIssue?.kind == .malformedJSON)
             #expect(model.session == nil && model.updater == nil && model.store == nil)
-            model.setQuitAfterLastWindow(true); model.setRetention(0)
+            model.setQuitAfterLastWindow(true)
             #expect(try Data(contentsOf: paths.configuration) == malformed)
             await model.retryStartup()
             #expect(model.phase == .configurationRecovery)
-            var repaired = AppConfiguration(); repaired.port = port; repaired.maxRollbackVersions = 3
+            var repaired = AppConfiguration(); repaired.port = port
             try ConfigurationStore(url: paths.configuration).save(repaired)
             await model.retryStartup()
             #expect(model.phase == .uninstalled)
@@ -47,7 +47,7 @@ struct StartupRecoveryTests {
     }
 
     @Test(.timeLimit(.minutes(1)), arguments: [false, true])
-    func nativeRecoveryPreservesCommittedOriginAndAllInstalledVersions(primaryMissing: Bool) async throws {
+    func nativeRecoveryPreservesCommittedOriginThenCleansInactiveVersionsAfterRender(primaryMissing: Bool) async throws {
         try await withStorageAppFixture { paths, dataStore, firstVersion in
             let transfer = OriginStorageTransfer(dataStore: dataStore)
             let configurationStore = ConfigurationStore(url: paths.configuration)
@@ -58,8 +58,6 @@ struct StartupRecoveryTests {
             for number in 1...3 { versions.append(try writePersistedInstallation(paths, tag: "v0.92.\(number)")) }
             let current = try #require(versions.last), pointer = paths.root.appendingPathComponent("versions-state.json")
             try JSONSerialization.data(withJSONObject: ["schema": 1, "currentID": current.id, "activationOrder": versions.map(\.id)]).write(to: pointer)
-            var committed = try configurationStore.load(); committed.maxRollbackVersions = 3
-            try configurationStore.save(committed)
             let broken = Data("{invalid preferences".utf8)
             if primaryMissing { try FileManager.default.removeItem(at: paths.configuration) }
             else { try broken.write(to: paths.configuration) }
@@ -68,18 +66,19 @@ struct StartupRecoveryTests {
             await model.start()
             #expect(model.phase == .configurationRecovery)
             #expect(model.startupIssue?.kind == (primaryMissing ? .missingPrimary : .malformedJSON))
+            #expect(try FileManager.default.contentsOfDirectory(atPath: paths.versions.path).count == 4)
             await model.resetConfigurationAndRestart()
             #expect(model.phase == .ready)
             #expect(model.configuration.port == port)
-            #expect(model.configuration.maxRollbackVersions == 3)
             #expect(model.currentVersion == current)
             if !primaryMissing {
                 let backup = try #require(model.configurationRecoveryBackup)
                 #expect(try Data(contentsOf: backup) == broken)
             }
             let store = try VersionStore(root: paths.root)
-            for version in versions { #expect(try await store.validate(version) == version) }
-            #expect(try await store.history().count == 3)
+            #expect(try await store.validate(current) == current)
+            for version in versions.dropLast() { #expect(!FileManager.default.fileExists(atPath: version.directoryURL.path)) }
+            #expect(try FileManager.default.contentsOfDirectory(atPath: paths.versions.path).count == 1)
             #expect(try await transfer.read(origin: fixtureOrigin(port)) == original)
             let session = try #require(model.session)
             let firstRead = try #require(try await session.page.callJavaScript("return window.initialStorageJSON;") as? String)

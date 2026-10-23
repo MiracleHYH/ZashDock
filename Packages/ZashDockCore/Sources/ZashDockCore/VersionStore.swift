@@ -2,44 +2,41 @@ import Foundation
 import Darwin
 
 public struct InstalledVersion: Codable, Sendable, Identifiable, Equatable {
+    public enum Source: String, Codable, Sendable { case githubRelease, localArchive }
     public let id: String
     public let tag: String
     public let sha256: String
     public let installedAt: Date
-    /// Only the validated content directory is served; manifests and activation state are outside it.
+    public let source: Source
+    /// Only the validated content directory is served; manifests and selection state are outside it.
     public let directoryURL: URL
-    public init(id: String, tag: String, sha256: String, installedAt: Date, directoryURL: URL) {
-        self.id = id; self.tag = tag; self.sha256 = sha256; self.installedAt = installedAt; self.directoryURL = directoryURL
+    public init(id: String, tag: String, sha256: String, installedAt: Date, directoryURL: URL, source: Source = .githubRelease) {
+        self.id = id; self.tag = tag; self.sha256 = sha256; self.installedAt = installedAt
+        self.directoryURL = directoryURL; self.source = source
     }
-}
-
-/// The durable selection made before cleanup starts. Planned removals can remain on disk
-/// after an interrupted/failed cleanup; the next prune safely retries them.
-/// Only managed version identifiers are recorded, never website data or configuration values.
-public struct VersionPruneReport: Codable, Sendable, Equatable {
-    public let recordedAt: Date
-    public let maxHistory: Int
-    public let invalidHistoryIDs: [String]
-    public let retainedHistoryIDs: [String]
-    public let protectedIDs: [String]
-    public let plannedRemovalIDs: [String]
+    private enum CodingKeys: String, CodingKey { case id, tag, sha256, installedAt, directoryURL, source }
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id); tag = try values.decode(String.self, forKey: .tag)
+        sha256 = try values.decode(String.self, forKey: .sha256); installedAt = try values.decode(Date.self, forKey: .installedAt)
+        directoryURL = try values.decode(URL.self, forKey: .directoryURL)
+        source = try values.decodeIfPresent(Source.self, forKey: .source) ?? .githubRelease
+    }
 }
 
 public actor VersionStore {
     private let paths: AppPaths
     private var stateURL: URL { paths.root.appendingPathComponent("versions-state.json") }
     private let extractor: SafeZIPExtractor
-    private struct State: Codable {
-        var schema = 1
-        var currentID: String?
-        var activationOrder: [String]
-        // Optional for backward compatibility with all existing schema-1 state files.
-        var lastPruneReport: VersionPruneReport?
-        // Preserve the most recent corruption record across later healthy startup cleanups.
-        var lastInvalidHistoryReport: VersionPruneReport?
-    }
+    // Older schema-1 selection files also contain activationOrder and prune reports.
+    // Those fields are ignored; only the current resource selection remains authoritative.
+    private struct State: Codable { var schema = 1; var currentID: String? }
     private struct Manifest: Codable {
-        let schema: Int; let id: String; let release: ZashboardRelease; let installedAt: Date; let files: [FileRecord]
+        let schema: Int; let id: String
+        let source: InstalledVersion.Source?
+        let tag: String?; let sha256: String?
+        let release: ZashboardRelease?
+        let installedAt: Date; let files: [FileRecord]
     }
     private struct FileRecord: Codable { let path: String; let size: Int; let sha256: String }
 
@@ -47,41 +44,50 @@ public actor VersionStore {
     public init(root: URL, extractor: SafeZIPExtractor = .init()) throws {
         paths = AppPaths(root: root); self.extractor = extractor
         try paths.createDirectories()
-        // Staging never contains an active version. Interrupted downloads/extractions are safe to discard.
         for temporary in try FileManager.default.contentsOfDirectory(at: paths.staging, includingPropertiesForKeys: nil) {
             try FileManager.default.removeItem(at: temporary)
         }
     }
 
-    /// Verify and unpack into a version directory, without changing the active version or pruning history.
+    /// Official downloads retain HTTPS source, published size and digest verification.
     public func prepare(zip: URL, release: ZashboardRelease) throws -> InstalledVersion {
         try release.validate(); try Task.checkCancellation()
         let baseID = release.tag + "-" + release.sha256.prefix(16)
         var id = baseID
-        var final = paths.versions.appendingPathComponent(id, isDirectory: true)
-        if FileManager.default.fileExists(atPath: final.path) {
+        if FileManager.default.fileExists(atPath: paths.versions.appendingPathComponent(id).path) {
             if let existing = try? validatedVersion(id: id) { return existing }
-            // A replacement gets a new directory. The prior current path is never removed mid-transaction.
             id = baseID + "-" + UUID().uuidString.prefix(8)
-            final = paths.versions.appendingPathComponent(id, isDirectory: true)
         }
+        return try prepareArchive(zip, id: id, expectedSize: release.assetSize, release: release)
+    }
+
+    /// Local import is fully offline. Its digest identifies the private copied input only;
+    /// it is never matched against a release catalog or presented as proof of official origin.
+    public func prepareLocalZIP(_ zip: URL) throws -> InstalledVersion {
+        try Task.checkCancellation()
+        let size = try zip.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
+        return try prepareArchive(zip, id: "local-" + UUID().uuidString, expectedSize: Int64(size), release: nil)
+    }
+
+    private func prepareArchive(_ zip: URL, id: String, expectedSize: Int64, release: ZashboardRelease?) throws -> InstalledVersion {
+        let final = paths.versions.appendingPathComponent(id, isDirectory: true)
         let temporary = paths.staging.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: temporary) }
         var moved = false, finished = false
         defer { if moved && !finished { try? FileManager.default.removeItem(at: final) } }
         let input = temporary.appendingPathComponent("input.zip")
-        try BoundedZIPInput(url: zip, expectedSize: release.assetSize).copy(to: input)
-        let size = try input.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
-        guard Int64(size) == release.assetSize, try ReleaseClient.digest(of: input, maximumBytes: release.assetSize) == release.sha256 else {
-            throw ZashDockError.verification("ZIP 与官方 SHA-256 或文件大小不符；当前版本保持不变。")
+        try BoundedZIPInput(url: zip, expectedSize: expectedSize).copy(to: input)
+        let digest = try ReleaseClient.digest(of: input, maximumBytes: expectedSize)
+        if let release, digest != release.sha256 {
+            throw ZashDockError.verification("ZIP 与官方 SHA-256 不符；当前版本保持不变。")
         }
         let candidate = temporary.appendingPathComponent("version", isDirectory: true)
         let content = candidate.appendingPathComponent("content", isDirectory: true)
         try FileManager.default.createDirectory(at: content, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try extractor.extract(input, to: content)
-        let installedAt = Date()
-        let manifest = Manifest(schema: 1, id: id, release: release, installedAt: installedAt, files: try fileRecords(in: content))
+        try extractor.extract(input, to: content, requiresJavaScript: release != nil)
+        let manifest = Manifest(schema: 2, id: id, source: release == nil ? .localArchive : .githubRelease,
+            tag: release?.tag ?? "本地导入", sha256: digest, release: release, installedAt: Date(), files: try fileRecords(in: content))
         try AtomicFile.encode(manifest, to: candidate.appendingPathComponent("manifest.json"))
         try Task.checkCancellation()
         try FileManager.default.moveItem(at: candidate, to: final)
@@ -98,114 +104,57 @@ public actor VersionStore {
         return try validatedVersion(id: id)
     }
 
-    /// Most recently activated historical versions first. Staged, never activated versions are excluded.
-    public func history() throws -> [InstalledVersion] {
-        let state = try readState()
-        return state.activationOrder.reversed().filter { $0 != state.currentID }.compactMap { try? validatedVersion(id: $0) }
-    }
-
-    public func lastPruneReport() throws -> VersionPruneReport? { try readState().lastPruneReport }
-    public func lastInvalidHistoryReport() throws -> VersionPruneReport? { try readState().lastInvalidHistoryReport }
-
     public func validate(_ version: InstalledVersion) throws -> InstalledVersion {
         let actual = try validatedVersion(id: version.id)
         guard actual == version else { throw ZashDockError.invalidInstallation("版本描述不匹配。") }
         return actual
     }
 
-    /// Removes an uncommitted candidate after a failed webpage validation. Activated versions are protected.
+    /// Only a non-current transaction candidate can be discarded.
     public func discardPrepared(_ version: InstalledVersion) throws {
         guard validID(version.id) else { throw ZashDockError.invalidInstallation("版本目录名称无效。") }
-        let state = try readState()
-        guard state.currentID != version.id, !state.activationOrder.contains(version.id) else { return }
+        guard try readState().currentID != version.id else { return }
         let directory = paths.versions.appendingPathComponent(version.id, isDirectory: true)
         if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
     }
 
-    /// Caller must first verify an actual webpage load. One atomic state write is the only commit point.
+    /// Caller first verifies the candidate webpage. This atomic write is the resource commit point.
     public func activate(_ version: InstalledVersion) throws {
         _ = try validate(version)
-        var state: State
-        do { state = try readState() }
+        do { _ = try readState() }
         catch {
-            // Preserve the original for diagnostics and allow explicit repair installation to commit.
             if FileManager.default.fileExists(atPath: stateURL.path) {
                 try FileManager.default.copyItem(at: stateURL, to: paths.root.appendingPathComponent("versions-state-corrupt-\(UUID().uuidString).json"))
             }
-            state = State(currentID: nil, activationOrder: [])
         }
-        state.activationOrder.removeAll { $0 == version.id }
-        state.activationOrder.append(version.id); state.currentID = version.id
-        try AtomicFile.encode(state, to: stateURL)
+        try AtomicFile.encode(State(currentID: version.id), to: stateURL)
     }
 
-    /// Pruning is deliberately separate from activation and is called only after verified commit.
-    /// An active server's protected ID is always retained, even if a caller has not yet released it.
-    @discardableResult
-    public func prune(maxHistory: Int, protecting: Set<String> = []) throws -> VersionPruneReport? {
-        guard (0...100).contains(maxHistory) else { throw ZashDockError.invalidConfiguration("历史版本保留数必须在 0–100 之间。") }
+    /// Called only after the current persistent webpage succeeds. Keeps current and explicitly
+    /// active resources, including any temporarily protected old service; no rollback history exists.
+    public func removeInactiveVersions(protecting: Set<String> = []) throws {
         guard protecting.allSatisfy(validID) else { throw ZashDockError.invalidConfiguration("受保护的版本标识无效。") }
         try Task.checkCancellation()
-        var state = try readState()
-        guard let currentID = state.currentID else { return nil }
+        let state = try readState()
+        guard let currentID = state.currentID else { return }
         _ = try validatedVersion(id: currentID)
-        let historical = state.activationOrder.reversed().filter { $0 != currentID }
-        var healthy: [String] = [], invalid: [String] = []
-        for identifier in historical {
-            try Task.checkCancellation()
-            do { _ = try validatedVersion(id: identifier); healthy.append(identifier) }
-            catch {
-                // A cancelled task or temporary I/O failure is not evidence of corrupt data.
-                // Abort before changing the pointer or deleting any directory in those cases.
-                guard Self.isInvalidInstallation(error) else { throw error }
-                invalid.append(identifier)
-            }
-        }
-        // Invalid history never consumes a rollback slot. Explicitly protected directories
-        // remain alive even when invalid or temporarily beyond the retention limit.
-        let keep = Set(healthy.prefix(maxHistory)).union(protecting).union([currentID])
+        let values = try paths.versions.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else { throw ZashDockError.invalidInstallation("受管版本目录无效。") }
         let directories = try FileManager.default.contentsOfDirectory(at: paths.versions, includingPropertiesForKeys: nil)
-        let byName = Dictionary(uniqueKeysWithValues: directories.map { ($0.lastPathComponent, $0) })
-        // Delete obsolete activated versions from oldest to newest, then sorted unreferenced
-        // preparations. Selection and the recorded plan do not depend on filesystem ordering.
-        let activatedRemovals = state.activationOrder.filter { !keep.contains($0) && byName[$0] != nil }
-        let activated = Set(state.activationOrder)
-        let orphanRemovals = byName.keys.filter { !keep.contains($0) && !activated.contains($0) }.sorted()
-        let removalIDs = activatedRemovals + orphanRemovals
-        let removals = removalIDs.compactMap { byName[$0] }
-        let report = VersionPruneReport(recordedAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)),
-            maxHistory: maxHistory, invalidHistoryIDs: invalid,
-            retainedHistoryIDs: healthy.filter { keep.contains($0) }, protectedIDs: protecting.sorted(),
-            plannedRemovalIDs: removalIDs)
+        guard directories.allSatisfy({ validID($0.lastPathComponent) }) else { throw ZashDockError.invalidInstallation("受管版本目录含无效名称。") }
+        let keep = protecting.union([currentID])
+        let removals = directories.filter { !keep.contains($0.lastPathComponent) }.sorted { $0.lastPathComponent < $1.lastPathComponent }
         try Task.checkCancellation()
-        // Persist the pruned activation list first. A crash can leave harmless unreferenced directories.
-        // The same atomic write records why invalid versions were excluded before they disappear.
-        state.activationOrder = state.activationOrder.filter { keep.contains($0) }
-        state.lastPruneReport = report
-        if !invalid.isEmpty { state.lastInvalidHistoryReport = report }
-        try AtomicFile.encode(state, to: stateURL)
-        for directory in removals { try FileManager.default.removeItem(at: directory) }
-        return report
-    }
-
-    private static func isInvalidInstallation(_ error: any Error) -> Bool {
-        if error is DecodingError { return true }
-        if let failure = error as? ZashDockError {
-            switch failure {
-            case .invalidInstallation, .verification: return true
-            default: return false
-            }
+        for directory in removals {
+            try Task.checkCancellation()
+            try FileManager.default.removeItem(at: directory)
         }
-        let failure = error as NSError
-        return failure.domain == NSCocoaErrorDomain && failure.code == NSFileReadNoSuchFileError
     }
 
     private func readState() throws -> State {
-        guard FileManager.default.fileExists(atPath: stateURL.path) else { return State(currentID: nil, activationOrder: []) }
+        guard FileManager.default.fileExists(atPath: stateURL.path) else { return State(currentID: nil) }
         let state = try AtomicFile.decode(State.self, from: stateURL)
-        guard state.schema == 1, Set(state.activationOrder).count == state.activationOrder.count,
-              state.activationOrder.allSatisfy(validID), state.currentID.map(validID) ?? true,
-              state.currentID.map({ state.activationOrder.contains($0) }) ?? state.activationOrder.isEmpty else {
+        guard state.schema == 1, state.currentID.map(validID) ?? true else {
             throw ZashDockError.invalidInstallation("版本指针损坏，请使用安装界面修复。")
         }
         return state
@@ -214,23 +163,44 @@ public actor VersionStore {
         !id.isEmpty && id.utf8.count <= 128 && id.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || ".-_".contains($0)) } && id != "." && id != ".."
     }
     private func validatedVersion(id: String) throws -> InstalledVersion {
+        try Task.checkCancellation()
         guard validID(id) else { throw ZashDockError.invalidInstallation("版本目录名称无效。") }
         let directory = paths.versions.appendingPathComponent(id, isDirectory: true)
         let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true else { throw ZashDockError.invalidInstallation("版本目录不存在或无效。") }
         let manifest = try AtomicFile.decode(Manifest.self, from: directory.appendingPathComponent("manifest.json"))
-        try manifest.release.validate()
-        guard manifest.schema == 1, manifest.id == id,
-              (id == manifest.release.tag + "-" + manifest.release.sha256.prefix(16) || id.hasPrefix(manifest.release.tag + "-" + manifest.release.sha256.prefix(16) + "-")) else { throw ZashDockError.invalidInstallation("安装清单无效。") }
+        guard (1...2).contains(manifest.schema), manifest.id == id else { throw ZashDockError.invalidInstallation("安装清单无效。") }
+        guard manifest.schema == 1 || (manifest.source != nil && manifest.tag != nil && manifest.sha256 != nil) else {
+            throw ZashDockError.invalidInstallation("安装清单缺少来源或完整性信息。")
+        }
+        let source = manifest.source ?? .githubRelease
+        let tag: String, digest: String
+        switch source {
+        case .githubRelease:
+            guard let release = manifest.release else { throw ZashDockError.invalidInstallation("官方安装清单缺少发行信息。") }
+            try release.validate()
+            guard (manifest.tag == nil || manifest.tag == release.tag), (manifest.sha256 == nil || manifest.sha256 == release.sha256),
+                  (id == release.tag + "-" + release.sha256.prefix(16) || id.hasPrefix(release.tag + "-" + release.sha256.prefix(16) + "-")) else {
+                throw ZashDockError.invalidInstallation("官方安装清单无效。")
+            }
+            tag = release.tag; digest = release.sha256
+        case .localArchive:
+            guard manifest.schema == 2, manifest.release == nil, manifest.tag == "本地导入",
+                  id.hasPrefix("local-"), UUID(uuidString: String(id.dropFirst(6))) != nil,
+                  let hash = manifest.sha256, hash.count == 64, hash.allSatisfy({ $0.isASCII && $0.isHexDigit }) else {
+                throw ZashDockError.invalidInstallation("本地安装清单无效。")
+            }
+            tag = "本地导入"; digest = hash
+        }
         let content = directory.appendingPathComponent("content", isDirectory: true)
         let actual = try fileRecords(in: content)
         guard actual.count == manifest.files.count,
               zip(actual, manifest.files).allSatisfy({ $0.path == $1.path && $0.size == $1.size && $0.sha256 == $1.sha256 }),
-              actual.contains(where: { $0.path == "index.html" && $0.size > 0 }), actual.contains(where: { $0.path.hasSuffix(".js") }) else {
-            throw ZashDockError.invalidInstallation("安装文件已损坏，请重新安装官方版本。")
+              actual.contains(where: { $0.path == "index.html" && $0.size > 0 }),
+              source == .localArchive || actual.contains(where: { $0.path.hasSuffix(".js") }) else {
+            throw ZashDockError.invalidInstallation("安装文件已损坏，请重新安装网页资源。")
         }
-        return InstalledVersion(id: id, tag: manifest.release.tag, sha256: manifest.release.sha256,
-                                installedAt: manifest.installedAt, directoryURL: content)
+        return InstalledVersion(id: id, tag: tag, sha256: digest, installedAt: manifest.installedAt, directoryURL: content, source: source)
     }
     private func fileRecords(in content: URL) throws -> [FileRecord] {
         let values = try content.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -274,7 +244,7 @@ public actor VersionStore {
 }
 
 /// Pins the selected regular file before copying. It never follows a final symlink, never copies more
-/// than the authenticated asset size, and rejects path replacement or file mutation during the copy.
+/// than the pinned input size, and rejects path replacement or file mutation during the copy.
 final class BoundedZIPInput {
     private let url: URL
     private let descriptor: Int32
@@ -288,7 +258,7 @@ final class BoundedZIPInput {
         guard source >= 0 else { throw ZashDockError.verification("无法安全打开 ZIP；不允许符号链接。") }
         var info = stat()
         guard fstat(source, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size == expectedSize else {
-            close(source); throw ZashDockError.verification("ZIP 必须是大小与官方资产一致的普通文件。")
+            close(source); throw ZashDockError.verification("ZIP 必须是大小有效且未变化的普通文件。")
         }
         self.url = url; self.descriptor = source; self.initial = info; self.expectedSize = expectedSize
     }

@@ -6,7 +6,7 @@
 
 生产 `AppModel`、`WebSession` 和 `OriginStorageTransfer` 共用 `WKWebsiteDataStore.default()`。Remote、选中后端及网页设置由官方 Zashboard 正常写入 WebKit，保留原始键值。日常运行不创建或维护原生 Remote 文件，没有常驻存储桥接、周期快照、Storage 方法包装或退出前 flush。重新加载同一网页也不会注入旧 seed。
 
-普通 `configuration.json` 只保存端口、资源历史数量、窗口行为及两项兼容/清理标记；`configuration.last-valid.json` 是这些小型元数据的恢复镜像。它们没有网页数据，不是另一套配置历史。网页资源版本也不携带对应 Remote 副本。
+普通 `configuration.json` 只保存端口、窗口行为及两项兼容/清理标记；`configuration.last-valid.json` 是这些小型元数据的恢复镜像。它们没有网页数据，不是另一套配置历史。网页资源安装也不携带对应 Remote 副本。
 
 WebKit 将数据按 `scheme + host + port` 隔离。`setup/api-list` 等上游键不含面板端口，改变原生端口不能直接重命名这些键。默认持久 DataStore 保留会话间数据的能力来自 [Apple 的公开接口](https://developer.apple.com/documentation/webkit/wkwebsitedatastore/default())；具体运行证据另见 [TESTING.md](TESTING.md)。
 
@@ -68,11 +68,11 @@ Swift 和 JavaScript 两端均校验格式及限额。恢复前先校验目标�
 
 中断发生在端口提交前，启动仍选择旧 Origin；提交后选择新 Origin，待清理标记可重试。此协议处理配置层中断边界，不能额外保证 WebKit 未提供承诺的断电落盘时序；系统重启、各阶段强制断电并未因此自动得到验收。
 
-## 更新与回滚保持同一份网页数据
+## 更新保持同一份网页数据
 
-更新/回滚不更改端口，不为每个资源版本保存用户配置。候选版本先将当前业务数据复制到独立 `.nonPersistent()` DataStore，在其中运行预检，防止失败候选在提交前破坏真实数据。预检成功后提交资源指针，再在持久 DataStore 启动新版本；只有持久 live 验证成功后才清理旧资源。
+更新不更改端口，不为资源安装保存用户配置。候选先将当前业务数据复制到独立 `.nonPersistent()` DataStore，在其中运行预检，防止失败候选在提交前破坏真实数据。预检成功后提交资源指针，再在持久 DataStore 启动新页面；只有持久 live 验证成功后才清理旧资源。应用只保留当前安装，没有资源回滚或历史保留设置。
 
-提交后的页面失败保留新指针与旧资源，提示重载，不自动回放旧用户数据或回退指针。新代码可能已经迁移持久 schema，资源回滚不等于配置回滚；手动回滚需要相同预检和上游向后兼容支持。未知数据库/schema 会使转移或预检读取失败并保留现状。
+提交后的页面失败保留新指针与暂未清理的原资源，提示重载，不自动回放旧用户数据。新代码可能已经迁移持久 schema。未知数据库/schema 会使转移或预检读取失败并保留现状。
 
 ## 一次性旧密文兼容
 

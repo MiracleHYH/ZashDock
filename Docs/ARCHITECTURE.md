@@ -15,7 +15,7 @@
 | `LegacyWebStorageReader` | `Sendable` 值类型 | 一次性只读兼容旧 AES-GCM LocalStorage 文件 |
 | `ZashboardUpdateManager` | `@MainActor @Observable` | 官方网页版本检查、下载进度、取消、准备和清理 |
 | `ReleaseClient` | `actor` | 官方 HTTPS 元数据、资产来源、大小与 SHA-256 验证 |
-| `VersionStore` | `actor` | 版本目录、内容清单、当前指针、历史顺序和清理报告 |
+| `VersionStore` | `actor` | 安装目录、内容清单、当前指针和非当前资源清理 |
 | `LoopbackHTTPServer` | 主线程入口、内部串行队列 | loopback 绑定、受限静态文件读取与流式发送 |
 | `SafeZIPExtractor` | 无共享可变状态的值类型 | ZIP 结构、路径、资源上限、解压和 CRC 校验 |
 | `ConfigurationStore` / `AtomicFile` | 同步值类型和工具 | 普通配置验证、原子提交与小型恢复镜像 |
@@ -34,8 +34,7 @@ HTTP 服务内部对象由独立串行 DispatchQueue 管理，不是 Swift actor
   configuration.json                 # 普通设置，唯一端口提交点
   configuration.last-valid.json      # 已提交普通设置的小型恢复镜像
   configuration-recovery/...         # 用户显式恢复前保全的原设置文件
-  official-releases.json             # 可信官方发行元数据缓存
-  versions-state.json                # 当前资源指针、激活顺序、清理报告
+  versions-state.json                # 当前资源指针
   versions/<version-id>/
     manifest.json
     content/index.html
@@ -50,7 +49,7 @@ WebKit 默认持久 DataStore（位置由 WebKit 管理）
     其他由 WebKit 管理的网站数据
 ```
 
-`configuration.json` 仅包含端口、历史保留数、窗口行为、`pendingOriginCleanup` 和 `legacyStorageImported`，不含 Remote、Secret 或网页配置。正常加载只读主文件，不自动选择恢复镜像。镜像用于原生界面显式恢复原端口，不能成为另一份 Remote 数据源。
+`configuration.json` 仅包含端口、窗口行为、`pendingOriginCleanup` 和 `legacyStorageImported`，不含 Remote、Secret 或网页配置。旧配置中的历史保留字段作为未知字段忽略，新保存不再编码。正常加载只读主文件，不自动选择恢复镜像。镜像用于原生界面显式恢复原端口，不能成为另一份 Remote 数据源。
 
 `save` 原子写入主文件后，尽力更新镜像；镜像失败不能把已经提交的端口报告为失败。清理旧 Origin 前必须先成功 `ensureRecoveryCopy`。因此镜像滞后时，它指向的旧业务数据仍保留。主文件损坏或丢失但有镜像时进入恢复界面；没有有效端口元数据时由用户指定原端口，不静默改用 9099。
 
@@ -60,7 +59,7 @@ WebKit 默认持久 DataStore（位置由 WebKit 管理）
 
 Bundle 不包含 Zashboard dist。首次安装和手动更新使用 Zephyruso/zashboard 官方稳定 Release，排除 draft/prerelease，精确选择带可信 SHA-256 的 `dist.zip`。URLSession 为临时会话，入口、每次重定向和最终 URL 均验证 HTTPS 与官方 GitHub 资产来源。下载增量写入并计算摘要，核对声明及实际大小；取消和失败删除临时下载。
 
-本地 ZIP 通过已缓存的可信官方摘要或内置 v3.29.1 发行摘要识别。内置内容只有元数据，没有网页资源。未知摘要的离线归档不能因名称或结构相同而获得官方身份。`BoundedZIPInput` 以 `O_NOFOLLOW` 打开普通文件、限额复制并检查身份/修改，再校验私有副本摘要。
+本地 ZIP 导入是独立入口，不访问 GitHub、不验证官方身份或匹配发行摘要，来源由用户判断。`BoundedZIPInput` 仍以 `O_NOFOLLOW` 打开普通文件、限额复制并检查身份/修改；本地摘要用于安装记录与内容完整性，不构成来源认证。本地安装显式标记 `.localArchive`，版本显示未知，不伪造官方发行元数据。应用不再内置离线发行摘要或维护官方摘要缓存。
 
 `SafeZIPExtractor` 先验证记录，再写入新的私有 staging 目录：
 
@@ -72,9 +71,9 @@ Bundle 不包含 Zashboard dist。首次安装和手动更新使用 Zephyruso/za
 | 条目数 | 20,000 |
 | 单条目压缩比 | 250 |
 
-解析器验证中央目录、本地头、UTF-8 名称、数据描述符、记录边界及 CRC，拒绝 ZIP64、加密、特殊文件、符号链接、路径穿越、重复及大小写/Unicode 冲突。只有 `index.html` 与必要 JavaScript 资源有效，才生成含文件大小和 SHA-256 的 `manifest.json`。读取/激活已安装版本也验证实际文件；目录存在不等于安装有效。
+解析器验证中央目录、本地头、UTF-8 名称、数据描述符、记录边界及 CRC，拒绝 ZIP64、加密、特殊文件、符号链接、路径穿越、重复及大小写/Unicode 冲突。归档须含非空 `index.html`；官方入口还要求外部 JavaScript 资源，本地导入可为内联脚本的自包含页面。生成的 `manifest.json` 记录文件大小与内部 SHA-256；读取/激活也验证实际文件，目录存在不等于页面可用。旧 schema1 官方清单继续可读，新清单区分官方发行与本地导入。
 
-校验后的候选移入版本目录，尚不改变当前指针。staging 和未激活候选不计入历史；失败不会预删旧版。网页代码预检和资源提交顺序见下文。
+候选先移入独立安装目录，尚不改变当前指针；失败不预删当前安装。网页代码预检和资源提交顺序见下文。
 
 ## 本地 HTTP 与 WebKit 边界
 
@@ -106,19 +105,21 @@ Bundle 不包含 Zashboard dist。首次安装和手动更新使用 Zephyruso/za
 
 旧端口被别的程序占用时，同一持久 DataStore 中的可信 `load(simulatedRequest:responseHTML:)` 文档仍可访问旧 Origin；实测路径不会向占用者发送请求。迁移仅覆盖当前已知官方业务格式，发现未知数据库/schema 或超限数据则提交前停止，详见存储文档。
 
-## 更新、回滚与历史清理
+## 更新与单一当前安装
 
-资源版本与网页数据分离，更新/回滚保持同一端口和持久 DataStore。没有随版本保存或回放用户配置。
+安装资源与网页数据分离，更新保持同一端口和持久 DataStore。没有随安装保存或回放用户配置，也不提供回滚或历史版本列表。
 
 1. 下载、解压、清单及文件验证完成后卸载旧网页，停止旧监听器。
 2. 读取当前业务数据到内存；候选服务绑定同一端口，将数据恢复到新建 `.nonPersistent()` DataStore，在其中执行候选官方网页并验证渲染及服务身份。
 3. 预检成功、取消检查通过后，原子提交 `versions-state.json` 的当前资源指针。
 4. 清理持久容器中的可丢弃缓存，启动当前版本的持久 live 页面。此时才允许新网页在真实数据上执行自身迁移。
-5. live 页面验证成功后执行历史清理。
+5. live 页面验证成功后执行 `removeInactiveVersions`，只保留当前安装和临时显式保护的活跃目录。
 
-提交前失败不会让候选代码接触持久网页数据，恢复原服务/页面，保留原资源指针。指针提交后 live 失败则保留新指针和历史资源，显示重载入口，**不自动回退指针，也不清理历史**。因为新代码此时可能已修改持久数据，不能承诺资源回退等于网页数据回滚。手动回滚也需预检；上游数据 schema 的向后兼容性仍有实际边界。
+提交前失败不会让候选代码接触持久网页数据，恢复原服务/页面，保留原资源指针。指针提交后 live 失败则保留新指针和尚未清理的原资源，显示重载入口。因为新代码此时可能已修改持久数据，应用不自动回放旧用户数据。资源暂存用于失败恢复，不构成面向用户的回滚功能。
 
-历史按激活顺序维护，回滚也是一次激活。`maxRollbackVersions=N` 默认 1、范围 0–100，不含当前版本。清理先验证健康历史再保留最近 N 个；损坏历史不挤占名额，有明确清理/损坏报告。当前及显式保护的活跃版本不删除，短暂保护解除后再执行上限。权限、枚举错误或取消不能伪装成损坏并删除。清理仅作用于资源版本目录，不触及网页数据、旧密文或普通设置。
+成功状态只保留当前安装。启动时先确认当前资源与页面可用，再清理旧版遗留的历史或中断候选目录。当前损坏或操作取消时不清理；临时活跃保护解除后重试。清理仅作用于受管资源目录，不触及网页数据、旧密文或普通设置；没有历史顺序、保留数量或回滚 API。
+
+主窗口没有右上角设置或版本控件。独立 `Settings` Scene 自动提供系统 App 菜单的“设置…”与 ⌘,；服务故障页仍可用 SettingsLink 直接打开端口设置。`ZashDockCommands` 复用应用菜单操作，“关于 ZashDock”通过公开 AppKit 标准 About 面板展示两项版本。设置的“更新”和“关于”也同时显示明确标注的 ZashDock 完整版本（含构建号）与 Zashboard 版本；本地导入显示“本地导入（版本未知）”。首次使用只显示标题，以及“下载并安装”和右侧图标导入按钮。
 
 ## 缓存、安全与发布边界
 
@@ -132,6 +133,6 @@ Zashboard 网页更新来自 Zephyruso/zashboard；ZashDock 应用更新来自 M
 
 ## 验证范围
 
-Core 覆盖 ZIP、资源历史、普通元数据和只读旧文件兼容；App 宿主覆盖两个官方格式 Remote、选中项、业务 IndexedDB、旧端口被占、目标绑定/元数据失败、清理重试、更新回滚、缓存和原生交互。测试使用隔离临时目录及 DataStore，不操作生产 Remote 或 Keychain。
+Core 覆盖离线任意来源 ZIP、在线官方摘要、单一当前安装、普通元数据和只读旧文件兼容；App 宿主覆盖两个官方格式 Remote、业务 IndexedDB、端口事务、成功更新清旧资源、失败/取消保留原版、缓存和原生交互。测试使用隔离临时目录及 DataStore，不操作生产 Remote 或 Keychain。
 
 实际执行结果、跨进程证据及未执行项集中在 [TESTING.md](TESTING.md)。API 的 macOS 26 availability 和 SDK 编译不代表已在 macOS 26 实机或系统重启后验收；当前运行证据来自 macOS 27.0.1。历史 [AUDIT-2026-10-23.md](AUDIT-2026-10-23.md) 是问题发现时的记录，现状以当前源码和修复记录为准。

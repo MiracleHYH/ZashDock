@@ -12,6 +12,14 @@ on:
         description: 'Positive integer, greater than every published build'
         required: true
         type: string
+      signing_mode:
+        description: 'developer-id requires Apple credentials; adhoc is not Apple-notarized'
+        required: true
+        type: choice
+        default: developer-id
+        options:
+          - developer-id
+          - adhoc
       confirm:
         description: 'Type PUBLISH to create a public release and update the feed'
         required: true
@@ -28,7 +36,7 @@ concurrency:
 jobs:
   publish:
     if: github.repository == 'MiracleHYH/ZashDock' && github.ref == 'refs/heads/main' && inputs.confirm == 'PUBLISH'
-    name: Sign, notarize, and publish
+    name: Build, sign, and publish
     environment: release
     runs-on: macos-26
     timeout-minutes: 60
@@ -48,6 +56,7 @@ jobs:
           test "$(uname -m)" = arm64
           xcodebuild -version
           Scripts/test-core.sh
+          Scripts/test-release-profiles.sh
           xcodebuild -project ZashDock.xcodeproj -scheme ZashDock \
             -configuration Debug -destination 'platform=macOS,arch=arm64' \
             -derivedDataPath build/ReleaseTests -resultBundlePath build/ReleaseTests.xcresult \
@@ -61,12 +70,14 @@ jobs:
             CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO archive
           Scripts/test-release-diagnostics.sh build/ReleaseDiagnosticsTests.xcarchive
 
-      - name: Publish the signed App and feed
+      - name: Publish with Developer ID and Apple notarization
+        if: inputs.signing_mode == 'developer-id'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
           RELEASE_BUILD_NUMBER: ${{ inputs.build_number }}
+          RELEASE_SIGNING_MODE: developer-id
           RELEASE_CONFIRM: ${{ inputs.confirm }}
           RELEASE_DIAGNOSTICS_DIR: ${{ runner.temp }}/zashdock-release-diagnostics
           DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
@@ -75,6 +86,20 @@ jobs:
           NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
           NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: Scripts/release.sh --publish
+
+      # Never load Apple certificate or notarization secrets in the ad-hoc profile.
+      - name: Publish with ad-hoc App signing and signed Sparkle updates
+        if: inputs.signing_mode == 'adhoc'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_BUILD_NUMBER: ${{ inputs.build_number }}
+          RELEASE_SIGNING_MODE: adhoc
+          RELEASE_CONFIRM: ${{ inputs.confirm }}
+          RELEASE_DIAGNOSTICS_DIR: ${{ runner.temp }}/zashdock-release-diagnostics
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: Scripts/release.sh --publish
 

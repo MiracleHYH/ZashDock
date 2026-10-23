@@ -57,7 +57,7 @@ func writePersistedInstallation(_ paths: AppPaths, tag: String = "v0.92.0") thro
     let sha = String(repeating: "a", count: 64), id = tag + "-" + String(repeating: "a", count: 16)
     let directory = paths.versions.appendingPathComponent(id, isDirectory: true), content = directory.appendingPathComponent("content", isDirectory: true)
     try FileManager.default.createDirectory(at: content.appendingPathComponent("assets"), withIntermediateDirectories: true)
-    let html = "<html><head><script>window.initialStorageJSON=JSON.stringify(Object.fromEntries(Object.keys(localStorage).map(key=>[key,localStorage.getItem(key)])));</script><script src='/assets/app.js'></script></head><body><div id='app'>Recovery</div></body></html>"
+    let html = "<html><head><script>\(originFirstReadFixtureScript)</script><script src='/assets/app.js'></script></head><body><div id='app'>Recovery</div></body></html>"
     let files = [("assets/app.js", Data("window.ready=true;".utf8)), ("index.html", Data(html.utf8))]
     for (path, data) in files { try data.write(to: content.appendingPathComponent(path)) }
     let manifest: [String: Any] = ["schema": 1, "id": id, "installedAt": "2026-01-01T00:00:00Z",
@@ -67,3 +67,11 @@ func writePersistedInstallation(_ paths: AppPaths, tag: String = "v0.92.0") thro
     try JSONSerialization.data(withJSONObject: ["schema": 1, "currentID": id, "activationOrder": [id]]).write(to: paths.root.appendingPathComponent("versions-state.json"))
     return InstalledVersion(id: id, tag: tag, sha256: sha, installedAt: Date(timeIntervalSince1970: 1_767_225_600), directoryURL: content)
 }
+
+// Test-only provenance for the supplied official fixture. Local import never consults this
+// metadata or guesses the release identity; production contains no offline known-hash seed.
+let officialV3291FixtureRelease = ZashboardRelease(
+    tag: "v3.29.1", publishedAt: Date(timeIntervalSince1970: 1_790_151_447),
+    assetURL: URL(string: "https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist.zip")!,
+    assetSize: 9_570_334,
+    sha256: "4f16cce229e223bd07b5a3daccfbfb8bf349d7335572d412959284ab6c9bab50")

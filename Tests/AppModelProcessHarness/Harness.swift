@@ -186,7 +186,10 @@ private final class HarnessDelegate: NSObject, NSApplicationDelegate {
               value["localStorage"] as? [String: String] == localStorage,
               value["databases"] as? [String: [String: String]] == databases else { throw HarnessFailure.fixtureMismatch }
         let saved = try ConfigurationStore(url: model.paths!.configuration).load()
-        guard saved.port == expectedPort else { throw HarnessFailure.fixtureMismatch }
+        guard saved.port == expectedPort, model.currentVersion?.source == .githubRelease else { throw HarnessFailure.fixtureMismatch }
+        let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: model.paths!.configuration)) as? [String: Any]
+        guard let metadata, Set(metadata.keys).isSubset(of: ["port", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
+        else { throw HarnessFailure.fixtureMismatch }
     }
     private func report(_ phase: String, at root: URL, configuration: AppConfiguration) throws {
         try AtomicFile.encode(ProcessResult(phase: phase, pid: getpid(), success: true, currentPort: configuration.port,

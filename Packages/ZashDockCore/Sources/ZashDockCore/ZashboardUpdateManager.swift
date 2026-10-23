@@ -3,7 +3,6 @@ import Observation
 
 @MainActor @Observable
 public final class ZashboardUpdateManager {
-    public private(set) var releases: [ZashboardRelease] = []
     public private(set) var latest: ZashboardRelease?
     public private(set) var progress: DownloadProgress?
     public private(set) var isBusy = false
@@ -24,66 +23,51 @@ public final class ZashboardUpdateManager {
         defer { isBusy = false }
         do {
             try Task.checkCancellation()
-            latest = try await client.latest()
-            releases = try await client.stableReleases()
-            status = "版本目录已更新。"
+            let release = try await client.latest()
+            try Task.checkCancellation()
+            latest = release; status = "已获取最新官方稳定版。"
         } catch {
             if error is CancellationError || Task.isCancelled {
-                lastError = nil; status = "已取消检查更新。"
-                throw CancellationError()
+                lastError = nil; status = "已取消检查更新。"; throw CancellationError()
             }
-            lastError = error.localizedDescription; status = "检查失败，可重试或导入官方 ZIP。"; throw error
+            lastError = error.localizedDescription; status = "检查失败，可重试或导入本地 ZIP。"; throw error
         }
     }
 
-    public func stageLatest() async throws -> InstalledVersion {
-        try await runStage(localZIP: nil, release: nil)
-    }
-
-    public func stage(release: ZashboardRelease) async throws -> InstalledVersion {
-        try await runStage(localZIP: nil, release: release)
-    }
-
-    public func stageLocalZIP(_ zip: URL) async throws -> InstalledVersion {
-        try await runStage(localZIP: zip, release: nil)
-    }
-
+    public func stageLatest() async throws -> InstalledVersion { try await runStage(localZIP: nil, release: nil) }
+    public func stage(release: ZashboardRelease) async throws -> InstalledVersion { try await runStage(localZIP: nil, release: release) }
+    public func stageLocalZIP(_ zip: URL) async throws -> InstalledVersion { try await runStage(localZIP: zip, release: nil) }
     public func cancel() { stagingTask?.cancel() }
 
-    /// Stage first, verify the candidate through WebKit, then call this explicit commit.
-    public func commit(version: InstalledVersion, maxHistory: Int, protecting: Set<String> = []) async throws {
+    /// The caller verifies the persistent live webpage before removing obsolete resources.
+    public func commit(version: InstalledVersion) async throws {
         try await store.activate(version)
-        // Cleanup failure must never invalidate a successful activation or its current directory.
-        do { try await store.prune(maxHistory: maxHistory, protecting: protecting) }
-        catch { status = "版本已切换；历史清理将在下次操作时重试。"; lastError = error.localizedDescription; return }
+        do { try await store.removeInactiveVersions() }
+        catch { status = "版本已切换；旧资源清理将在下次启动时重试。"; lastError = error.localizedDescription; return }
         status = "已启用 \(version.tag)。"
     }
 
     private func runStage(localZIP: URL?, release providedRelease: ZashboardRelease?) async throws -> InstalledVersion {
         guard !isBusy else { throw ZashDockError.invalidConfiguration("另一个版本操作正在进行。") }
         isBusy = true; lastError = nil; progress = nil
-        status = localZIP == nil ? "正在获取官方稳定版…" : "正在验证本地官方 ZIP…"
+        status = localZIP == nil ? "正在获取官方稳定版…" : "正在导入本地 ZIP…"
         let client = client, store = store, downloadDirectory = downloadDirectory
         let task = Task { [weak self] () throws -> InstalledVersion in
+            try Task.checkCancellation()
+            if let localZIP {
+                self?.status = "正在解压本地 ZIP…"
+                return try await store.prepareLocalZIP(localZIP)
+            }
             let release: ZashboardRelease
             if let providedRelease { release = providedRelease }
-            else if let localZIP { release = try await client.identifyLocalZIP(localZIP) }
             else { release = try await client.latest(); self?.latest = release }
             try Task.checkCancellation()
-            self?.status = localZIP == nil ? "正在下载官方 \(release.tag)…" : "正在验证本地官方 ZIP…"
-            let zip: URL
-            var downloaded: URL?
-            if let localZIP { zip = localZIP }
-            else {
-                try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                zip = downloadDirectory.appendingPathComponent("download-\(UUID().uuidString).zip")
-                downloaded = zip
-            }
-            defer { if let downloaded { try? FileManager.default.removeItem(at: downloaded) } }
-            if localZIP == nil {
-                try await client.download(release, to: zip) { [weak self] update in
-                    await MainActor.run { self?.progress = update }
-                }
+            self?.status = "正在下载官方 \(release.tag)…"
+            try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let zip = downloadDirectory.appendingPathComponent("download-\(UUID().uuidString).zip")
+            defer { try? FileManager.default.removeItem(at: zip) }
+            try await client.download(release, to: zip) { [weak self] update in
+                await MainActor.run { self?.progress = update }
             }
             try Task.checkCancellation()
             self?.status = "正在校验并解压 \(release.tag)…"
@@ -93,12 +77,10 @@ public final class ZashboardUpdateManager {
         defer { isBusy = false; stagingTask = nil }
         do {
             let version = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
-            status = "文件验证成功，等待网页加载验证。"
+            status = "资源已准备，正在载入网页。"
             return version
-        } catch is CancellationError {
-            status = "已取消；现有版本保持可用。"; throw CancellationError()
         } catch {
-            if task.isCancelled || Task.isCancelled {
+            if error is CancellationError || task.isCancelled || Task.isCancelled {
                 status = "已取消；现有版本保持可用。"; throw CancellationError()
             }
             lastError = error.localizedDescription; status = "安装失败，可重试。"; throw error

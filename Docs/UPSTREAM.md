@@ -13,15 +13,17 @@
 
 官方[发布流水线](https://github.com/Zephyruso/zashboard/blob/v3.29.1/.github/workflows/deploy.yml#L84)执行 `zip -r dist.zip dist`。实测归档有 **324 个条目**，声明的解压总大小为 **12,140,880 字节**，使用单一顶层目录 `dist/`。必要文件包括 `dist/index.html`、`dist/assets/`；另有 `sw.js`、`registerSW.js`、`manifest.webmanifest`、图标和字体。ZashDock 应将 `dist/` 内容作为静态站点根目录，不能把 GitHub 自动生成的源码 ZIP 当作发行资产。
 
-ZIP 的目录约定、大小和摘要都是本次发行的观测结果，不能代替对每个安装包的独立验证。验证应覆盖路径规范化、绝对路径和 `..`、符号链接、重复及大小写冲突路径、文件数量、累计解压字节、压缩比和必要文件；在验证完成前不能切换当前版本。临时下载和解压目录不应计入历史版本。
+ZIP 的目录约定、大小和摘要都是本次发行的观测结果，不能代替对每个安装包的独立验证。验证应覆盖路径规范化、绝对路径和 `..`、符号链接、重复及大小写冲突路径、文件数量、累计解压字节、压缩比和必要文件；在验证完成前不能切换当前版本。临时下载和解压目录不属于已启用资源；当前页面验证成功后仅保留当前资源，不提供历史保留或回滚。
 
 下载入口和每一次重定向均须使用 HTTPS。允许列表应只覆盖官方 GitHub API、发行下载入口及 GitHub 实际使用的发行资产 CDN，不能因为入口来自 GitHub 就放行任意重定向目标。资产摘要提供内容完整性校验，信任根仍是通过 HTTPS 获取的官方发行元数据。
 
-## 离线导入的信任边界
+## 本地导入的来源边界
 
-ZIP 结构正确、文件名叫 `dist.zip`、页面标题相同，都不能证明归档来自官方。离线导入需要将实际 SHA-256 与此前可信取得并保存的官方 `dist.zip` digest 比较，或者与应用明确内置的官方发行摘要比较。匹配成功后，仍须完成完整 ZIP 安全验证。
+按用户选择，本地 ZIP 导入接受用户选定的任意有效静态归档，完全离线执行，不验证官方身份、不匹配官方已知摘要，也不查询或缓存 GitHub 发行目录。生产代码不内置离线官方摘要 seed。文件名、页面标题和 ZIP 内容不能据此识别为某个官方版本；本地包统一记录为 `localArchive`，显示“本地导入（版本未知）”。
 
-若完全离线且没有该资产的可信摘要，不能将未知归档标记为“已验证官方发行”；应保留现有版本，说明无法验证来源，并允许用户联网取得官方元数据后重试。不得为了离线备用功能信任任意用户输入的摘要、第三方下载站或仅有版本名称的 ZIP。
+归档仍须通过路径、ZIP 结构、条目数、解压总量、压缩比、CRC、必要静态资源等安全检查，并在隔离 WebKit profile 中实际渲染验证后才可激活。复制后的 ZIP 自算 SHA-256 用于内部完整性校验，不作为官方来源证明。失败或取消时现有当前资源与日常 WebKit 配置保留。
+
+在线下载安装继续只使用官方 GitHub Releases 的指定 `dist.zip`，验证 HTTPS、重定向来源、大小和官方摘要。本文前述 v3.29.1 摘要是研究时的实际观测，测试代码也用它确认指定样本；它不再构成生产本地导入的准入条件。
 
 ## Remote 和 LocalStorage
 
@@ -66,7 +68,7 @@ LocalStorage 并非上游全部网页数据。官方还使用 IndexedDB：
 
 清理不调用全类型 WebsiteDataStore 删除，不包含 LocalStorage、IndexedDB、Cookie 或凭据。WebKit 站点记录粒度不等于精确单端口，不能宣称只清理一个端口缓存。Apple 提供独立的 [Service Worker 注册数据类型](https://developer.apple.com/documentation/webkit/wkwebsitedatatypeserviceworkerregistrations)和 [Fetch Cache 数据类型](https://developer.apple.com/documentation/webkit/wkwebsitedatatypefetchcache)，用于选择性处理。
 
-资源版本与用户数据没有一一对应的快照。更新和回滚先将已支持业务数据复制到 `.nonPersistent()` DataStore，验证候选网页，再提交当前资源指针；持久 live 页面验证成功才清理历史。指针提交后 live 失败保留新指针和旧资源，提示重载，不能承诺回退资源即可撤销上游已执行的数据迁移。
+资源版本与用户数据没有一一对应的快照。更新或本地导入先将已支持业务数据复制到 `.nonPersistent()` DataStore，验证候选网页，再提交当前资源指针；持久 live 页面验证成功后删除非当前资源，只保留当前版本。旧安装的历史目录也在当前页面成功启动后清理。指针提交后 live 失败会保留新指针和旧资源并提示重载，不提前清理。产品不再提供回滚，也不创建用户数据的版本快照；资源替换不能撤销上游已执行的数据迁移。
 
 ## HTTP、WebSocket 和 CORS
 
@@ -82,7 +84,7 @@ LAN/VPN 连通性还取决于用户网络路由、Surge 运行模式、服务绑
 
 官方 [`upgradeUIAPI`](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/api/clash.ts#L236)调用所选远程 Mihomo 的 `POST /upgrade/ui`；网页[自动更新逻辑](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/assembly/version.ts#L147)也可能触发它。该接口不管理 ZashDock 的本地发行目录。`ZashboardUpdateManager` 直接使用官方 GitHub Releases 和本地版本事务，不调用 Mihomo `/upgrade/ui`，也不把该接口的成功误报成本地升级。官方网页资源保持原样，不能把原生导航策略描述成拦截全部远程子资源请求。
 
-ZashDock Wrapper 自身的 Sparkle 更新来自 [MiracleHYH/ZashDock](https://github.com/MiracleHYH/ZashDock)，与 Zashboard 网页更新分开；仓库配置与签名流程见 [RELEASING.md](RELEASING.md)。本轮开发不创建 Release。
+ZashDock Wrapper 自身的 Sparkle 更新来自 [MiracleHYH/ZashDock](https://github.com/MiracleHYH/ZashDock)，与 Zashboard 网页更新分开；仓库配置与签名流程见 [RELEASING.md](RELEASING.md)。上游核验与首次源码推送阶段没有创建 Release。随后准备的 `v1.0.0` 为通过 GitHub 直接分发的正式版，无需上架 App Store；使用显式 ad hoc 模式，未经过 Developer ID 签名和 Apple 公证。正式版的更新包及稳定 Sparkle Feed 仍须通过专用密钥签名和验证，不能用 ad hoc 模式跳过更新完整性检查。Apple 分发身份及 Gatekeeper 限制独立于产品版本成熟度；功能与边界见 [v1.0.0 发行说明](https://github.com/MiracleHYH/ZashDock/blob/main/Docs/RELEASE-NOTES-1.0.0.md)。
 
 ## 研究方法与实际执行记录
 

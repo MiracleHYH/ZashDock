@@ -11,15 +11,35 @@ struct ConfigurationMetadataTests {
     }
 
     @Test
-    func olderConfigurationDefaultsOnlyNewMetadataFields() throws {
+    func olderConfigurationIgnoresHistoryAndDefaultsOnlyNewMetadataFields() throws {
         let bytes = Data(#"{"port":23456,"maxRollbackVersions":3,"quitAfterLastWindowCloses":true}"#.utf8)
         let decoded = try JSONDecoder().decode(AppConfiguration.self, from: bytes)
-        #expect(decoded.port == 23456 && decoded.maxRollbackVersions == 3 && decoded.quitAfterLastWindowCloses)
+        #expect(decoded.port == 23456 && decoded.quitAfterLastWindowCloses)
         #expect(decoded.pendingOriginCleanup == nil && !decoded.legacyStorageImported)
         try withStore { store, _ in
             try bytes.write(to: store.url)
             #expect(try store.load() == decoded)
             #expect(store.recoverableConfiguration() == nil)
+        }
+    }
+
+    @Test(arguments: ["0", "1", "3", "-1", "101", "1000000000000", "\"invalid\"", "null", "{}", "[1,2,3]", "true"])
+    func removedHistoryFieldIsIgnoredWithoutChangingCommittedOrigin(value: String) throws {
+        try withStore { store, _ in
+            let bytes = Data((#"{"port":34567,"quitAfterLastWindowCloses":true,"pendingOriginCleanup":23456,"legacyStorageImported":true,"maxRollbackVersions":"# + value + "}").utf8)
+            try bytes.write(to: store.url)
+            let decoded = try JSONDecoder().decode(AppConfiguration.self, from: bytes)
+            #expect(decoded.port == 34567 && decoded.quitAfterLastWindowCloses)
+            #expect(decoded.pendingOriginCleanup == 23456 && decoded.legacyStorageImported)
+            #expect(try store.load() == decoded)
+            #expect(try Data(contentsOf: store.url) == bytes)
+            try store.save(decoded)
+            #expect(try store.load() == decoded && store.recoverableConfiguration() == decoded)
+            for url in [store.url, store.recoveryCopyURL] {
+                let encoded = try Data(contentsOf: url)
+                let fields = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+                #expect(Set(fields.keys) == ["port", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
+            }
         }
     }
 
@@ -39,7 +59,7 @@ struct ConfigurationMetadataTests {
             var original = AppConfiguration(); original.port = 23456
             try store.save(original)
             let mirror = try Data(contentsOf: store.recoveryCopyURL)
-            let bytes = Data((#"{"port":9099,"maxRollbackVersions":1,"quitAfterLastWindowCloses":false,"# + field + "}").utf8)
+            let bytes = Data((#"{"port":9099,"quitAfterLastWindowCloses":false,"# + field + "}").utf8)
             try bytes.write(to: store.url)
             #expect(throws: ConfigurationLoadFailure(kind: kind)) { try store.load() }
             #expect(throws: (any Error).self) { try JSONDecoder().decode(AppConfiguration.self, from: bytes) }
@@ -60,7 +80,7 @@ struct ConfigurationMetadataTests {
             #expect(store.recoverableConfiguration() == committed)
             let bytes = try Data(contentsOf: store.recoveryCopyURL)
             let fields = try #require(try JSONSerialization.jsonObject(with: bytes) as? [String: Any])
-            #expect(Set(fields.keys) == ["port", "maxRollbackVersions", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
+            #expect(Set(fields.keys) == ["port", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
             #expect(bytes.count < 256)
             let mode = try FileManager.default.attributesOfItem(atPath: store.recoveryCopyURL.path)[.posixPermissions] as? NSNumber
             #expect(mode?.intValue == 0o600)
@@ -75,7 +95,7 @@ struct ConfigurationMetadataTests {
     func corruptPrimaryDoesNotSilentlyChooseMirrorAndResetKeepsOriginMetadata() throws {
         try withStore { store, _ in
             var committed = AppConfiguration(); committed.port = 34567; committed.pendingOriginCleanup = 23456
-            committed.legacyStorageImported = true; committed.quitAfterLastWindowCloses = true; committed.maxRollbackVersions = 3
+            committed.legacyStorageImported = true; committed.quitAfterLastWindowCloses = true
             try store.save(committed)
             let damaged = Data("{damaged primary".utf8); try damaged.write(to: store.url)
             #expect(throws: ConfigurationLoadFailure.self) { try store.load() }
@@ -85,7 +105,7 @@ struct ConfigurationMetadataTests {
             let recovered = try store.load()
             #expect(recovered.port == committed.port && recovered.pendingOriginCleanup == committed.pendingOriginCleanup)
             #expect(recovered.legacyStorageImported)
-            #expect(!recovered.quitAfterLastWindowCloses && recovered.maxRollbackVersions == 1)
+            #expect(!recovered.quitAfterLastWindowCloses)
         }
     }
 

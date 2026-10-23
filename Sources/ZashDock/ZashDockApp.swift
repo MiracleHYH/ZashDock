@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import WebKit
 import UniformTypeIdentifiers
@@ -20,18 +21,39 @@ struct ZashDockApp: App {
                 }
             }
         }.defaultSize(width: 1160, height: 780)
-            .commands {
-                CommandGroup(after: .appInfo) {
-                    Button("检查 ZashDock 更新…") { wrapperUpdater.checkForUpdates() }
-                        .disabled(!wrapperUpdater.canCheckForUpdates)
-                }
-                CommandGroup(after: .toolbar) {
-                    Button("重新载入 Zashboard") { model.reload() }
-                        .keyboardShortcut("r").disabled(model.currentVersion == nil || model.isBusy)
-                    Button("检查 Zashboard 更新…") { model.checkForUpdates() }.disabled(model.isBusy || model.updater == nil)
-                }
-            }
+            .commands { ZashDockCommands(model: model, wrapperUpdater: wrapperUpdater) }
         Settings { SettingsView(model: model, wrapperUpdater: wrapperUpdater) }
+    }
+}
+
+struct ZashDockCommands: Commands {
+    let model: AppModel
+    let wrapperUpdater: WrapperUpdateController
+    var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("关于 ZashDock") { showAbout() }
+        }
+        CommandGroup(after: .appInfo) {
+            Button("检查 ZashDock 更新…") { wrapperUpdater.checkForUpdates() }
+                .disabled(!wrapperUpdater.canCheckForUpdates)
+        }
+        CommandGroup(after: .toolbar) {
+            Button("重新载入 Zashboard") { model.reload() }
+                .keyboardShortcut("r").disabled(model.currentVersion == nil || model.isBusy)
+            Button("检查 Zashboard 更新…") { model.checkForUpdates() }.disabled(model.isBusy || model.updater == nil)
+        }
+    }
+
+    private func showAbout() {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let versions = NSAttributedString(
+            string: "ZashDock 版本：\(wrapperUpdater.versionDescription)\nZashboard 版本：\(model.zashboardVersionDescription)",
+            attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize), .paragraphStyle: paragraph]
+        )
+        NSApplication.shared.orderFrontStandardAboutPanel(options: [
+            .applicationName: "ZashDock", .applicationVersion: "", .version: "", .credits: versions
+        ])
     }
 }
 
@@ -48,7 +70,10 @@ struct MainWindow: View {
                 VStack(spacing: 20) {
                     Image(systemName: model.phase == .damaged ? "wrench.and.screwdriver" : "square.and.arrow.down").font(.system(size: 48)).foregroundStyle(.secondary)
                     Text(title).font(.largeTitle.bold())
-                    Text(model.updater?.isBusy == true ? model.updater?.status ?? "" : model.status).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    if model.phase != .uninstalled {
+                        Text(model.updater?.isBusy == true ? model.updater?.status ?? "" : model.status)
+                            .foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    }
                     if model.phase == .starting || model.isBusy {
                         if let progress = model.updater?.progress {
                             ProgressView(value: progress.fractionCompleted).frame(width: 320)
@@ -62,10 +87,12 @@ struct MainWindow: View {
                             }
                             SettingsLink { Text("在设置中检查或更改端口") }.buttonStyle(.borderedProminent)
                         }
-                        Button("安装最新稳定版", systemImage: "arrow.down.circle") { model.install() }.buttonStyle(.borderedProminent)
-                            .disabled(!model.canManageVersions)
-                        Button("从本地官方 ZIP 导入…") { importing = true }
-                        Text("仅接受官方发布的 dist.zip；首次离线导入支持 v3.29.1。") .font(.caption).foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            Button("下载并安装", systemImage: "arrow.down.circle") { model.install() }
+                                .buttonStyle(.borderedProminent)
+                            Button("导入 ZIP", systemImage: "square.and.arrow.down.on.square") { importing = true }
+                                .labelStyle(.iconOnly).help("导入 ZIP…")
+                        }.controlSize(.large).disabled(!model.canManageVersions)
                         if model.currentVersion != nil || model.phase == .unavailable { Button("重试启动") { model.retryStart() } }
                     }
                 }.padding(40).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -84,12 +111,12 @@ struct MainWindow: View {
                 }.padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)).padding()
             }
         }
-        .toolbar {
-            if let version = model.currentVersion { Text(version.tag).font(.caption).foregroundStyle(.secondary) }
-            SettingsLink { Label("设置", systemImage: "gearshape") }
-        }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.zip]) { result in
-            switch result { case .success(let url): model.install(zip: url); case .failure(let error): model.errorMessage = error.localizedDescription }
+            switch result {
+            case .success(let url): model.install(zip: url)
+            case .failure(let error):
+                if (error as NSError).code != NSUserCancelledError { model.errorMessage = error.localizedDescription }
+            }
         }
         .alert("ZashDock", isPresented: Binding(get: { model.errorMessage != nil && !model.settingsVisible }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("好") { model.errorMessage = nil }
@@ -155,8 +182,7 @@ struct SettingsView: View {
             GeneralSettings(model: model).tabItem { Label("通用", systemImage: "gearshape") }
             UpdatesSettings(model: model, wrapperUpdater: wrapperUpdater).tabItem { Label("更新", systemImage: "arrow.triangle.2.circlepath") }
             Form {
-                LabeledContent("ZashDock", value: wrapperUpdater.versionDescription)
-                LabeledContent("Zashboard", value: model.currentVersion?.tag ?? "尚未安装")
+                AppVersions(wrapperVersion: wrapperUpdater.versionDescription, zashboardVersion: model.zashboardVersionDescription)
                 Link("ZashDock 项目", destination: WrapperUpdateController.repositoryURL)
                 Link("ZashDock 发布版本", destination: WrapperUpdateController.releasesURL)
                 Link("ZashDock MIT License", destination: WrapperUpdateController.repositoryURL.appendingPathComponent("blob/main/LICENSE"))
@@ -170,6 +196,15 @@ struct SettingsView: View {
             .alert("ZashDock", isPresented: Binding(get: { model.errorMessage != nil && model.settingsVisible }, set: { if !$0 { model.errorMessage = nil } })) {
                 Button("好") { model.errorMessage = nil }
             } message: { Text(model.errorMessage ?? "") }
+    }
+}
+
+struct AppVersions: View {
+    let wrapperVersion: String
+    let zashboardVersion: String
+    var body: some View {
+        LabeledContent("ZashDock 版本", value: wrapperVersion)
+        LabeledContent("Zashboard 版本", value: zashboardVersion)
     }
 }
 
@@ -188,8 +223,10 @@ struct UpdatesSettings: View {
                     if model.operation != nil { Button("取消", role: .cancel) { model.cancel() } }
                 }
             }
+            Section("版本") {
+                AppVersions(wrapperVersion: wrapperUpdater.versionDescription, zashboardVersion: model.zashboardVersionDescription)
+            }
             Section("ZashDock 应用") {
-                LabeledContent("当前版本", value: wrapperUpdater.versionDescription)
                 Button("检查 ZashDock 更新…") { wrapperUpdater.checkForUpdates() }
                     .disabled(!wrapperUpdater.canCheckForUpdates)
                 Toggle("自动检查 ZashDock 更新", isOn: Binding(
@@ -201,14 +238,13 @@ struct UpdatesSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Zashboard 网页") {
-                LabeledContent("当前版本", value: model.currentVersion?.tag ?? "尚未安装")
                 LabeledContent("最新稳定版", value: model.updater?.latest?.tag ?? "尚未检查")
                 HStack {
                     Button("检查更新") { model.checkForUpdates() }
                     if let latest = model.updater?.latest, latest.tag != model.currentVersion?.tag {
                         Button("安装 \(latest.tag)") { model.install(release: latest) }
                     }
-                    Button("导入官方 ZIP…") { importing = true }
+                    Button("导入 ZIP…") { importing = true }
                 }
                 if let updater = model.updater, !updater.status.isEmpty {
                     Text(updater.status).font(.caption).foregroundStyle(.secondary)
@@ -218,41 +254,12 @@ struct UpdatesSettings: View {
                     else { ProgressView().controlSize(.small) }
                 }
             }.disabled(model.isBusy || !model.canManageVersions)
-            Section("Zashboard 回滚") {
-                Stepper("最多保留 \(model.configuration.maxRollbackVersions) 个历史版本", value: Binding(get: { model.configuration.maxRollbackVersions }, set: { model.setRetention($0) }), in: 0...100)
-                Text("不包含当前版本。总保留上限为 \(model.configuration.maxRollbackVersions + 1)；按最近激活顺序清理。")
-                    .font(.caption).foregroundStyle(.secondary)
-                if model.history.isEmpty { Text("暂无可回滚的本地版本").foregroundStyle(.secondary) }
-                ForEach(model.history) { version in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(version.tag)
-                            Text(version.installedAt, style: .date).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button("回滚") { model.rollback(version) }
-                    }
-                }
-            }.disabled(model.isBusy || !model.canManageVersions)
-            if let releases = model.updater?.releases, !releases.isEmpty {
-                Section("官方历史版本") {
-                    DisclosureGroup("可下载的稳定版（\(releases.count)）") {
-                        ForEach(releases) { release in
-                            HStack {
-                                Text(release.tag)
-                                Spacer()
-                                Button("安装") { model.install(release: release) }
-                                    .disabled(release.tag == model.currentVersion?.tag)
-                            }
-                        }
-                    }
-                }.disabled(model.isBusy || !model.canManageVersions)
-            }
         }.formStyle(.grouped)
             .fileImporter(isPresented: $importing, allowedContentTypes: [.zip]) { result in
                 switch result {
                 case .success(let url): model.install(zip: url)
-                case .failure(let error): model.errorMessage = error.localizedDescription
+                case .failure(let error):
+                    if (error as NSError).code != NSUserCancelledError { model.errorMessage = error.localizedDescription }
                 }
             }
     }

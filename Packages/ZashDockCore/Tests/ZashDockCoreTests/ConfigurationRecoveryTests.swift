@@ -12,11 +12,11 @@ struct ConfigurationRecoveryTests {
 
     @Test(arguments: [
         ("{broken", ConfigurationLoadFailure.Kind.malformedJSON),
-        (#"{"port":"9099","maxRollbackVersions":1,"quitAfterLastWindowCloses":false}"#, .invalidFields),
-        (#"{"port":9099,"maxRollbackVersions":1}"#, .invalidFields),
-        (#"{"port":80,"maxRollbackVersions":1,"quitAfterLastWindowCloses":false}"#, .invalidValues),
-        (#"{"port":65536,"maxRollbackVersions":1,"quitAfterLastWindowCloses":false}"#, .invalidValues),
-        (#"{"port":9099,"maxRollbackVersions":-1,"quitAfterLastWindowCloses":false}"#, .invalidValues)
+        (#"{"port":"9099","quitAfterLastWindowCloses":false}"#, .invalidFields),
+        (#"{"port":9099}"#, .invalidFields),
+        (#"{"port":80,"quitAfterLastWindowCloses":false}"#, .invalidValues),
+        (#"{"port":65536,"quitAfterLastWindowCloses":false}"#, .invalidValues),
+        (#"{"port":-1,"quitAfterLastWindowCloses":false}"#, .invalidValues)
     ])
     func classifiesInvalidPreferencesWithoutChangingBytes(json: String, kind: ConfigurationLoadFailure.Kind) throws {
         try withStore { store, _ in
@@ -75,7 +75,7 @@ struct ConfigurationRecoveryTests {
         try withStore { store, root in
             try Data("bad".utf8).write(to: store.url)
             #expect(throws: ConfigurationLoadFailure.self) { try store.load() }
-            var repaired = AppConfiguration(); repaired.port = 23001; repaired.maxRollbackVersions = 3
+            var repaired = AppConfiguration(); repaired.port = 23001; repaired.quitAfterLastWindowCloses = true
             try store.save(repaired)
             #expect(try store.load() == repaired)
             #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("configuration-recovery").path))

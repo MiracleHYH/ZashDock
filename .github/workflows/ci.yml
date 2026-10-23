@@ -41,6 +41,10 @@ jobs:
           mkdir -p build/verification
           Scripts/test-core.sh 2>&1 | tee build/verification/ci-core.log
 
+      - name: Verify release signing profiles
+        shell: bash
+        run: Scripts/test-release-profiles.sh
+
       - name: Build and test the sandboxed App
         shell: bash
         run: |

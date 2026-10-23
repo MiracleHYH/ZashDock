@@ -1,5 +1,19 @@
 # 原生 UI 实际验收记录
 
+## 系统菜单与完整版本展示（当前）
+
+2026-10-23，按用户最新要求移除主窗口右上角原生设置和版本控件。通过 CUA 操作直接复用当前生产视图、`ZashDockCommands` 和 `Settings` Scene 的隔离 App（`build/ui-simplification/`），使用独立 Bundle ID、临时应用目录与非持久 WebKit，不加载或重置生产 Remote。
+
+- 主安装窗口截图和辅助功能树确认没有 Toolbar 或右上角按钮，首次页仍显示标题、下载按钮及右侧导入图标。
+- 实际点击系统应用菜单中的 `Settings…` 可打开独立设置窗口；关闭后执行 ⌘, 再次打开，窗口 ID 为 `com_apple_SwiftUI_Settings_window`。系统当前为英文，因此该菜单项由系统显示为 `Settings…`。
+- 设置的更新页在同一个“版本”区域同时显示 `ZashDock 版本 1.0.0 (1)` 和 `Zashboard 版本 v3.29.1`，截图确认无截断。后者仅为隔离 fixture 的已安装展示元数据，不声称 fixture 启动了真实官方页面。
+- 实际点击生产菜单命令“关于 ZashDock”，标准 About 面板同时显示上述两行；未安装状态则明确显示“Zashboard 版本：尚未安装”。显式空默认版本项没有产生重复 Version 行；当前深色外观的文字可读，两行均完整。
+- 两个隔离 App 最后均通过 ⌘Q 正常退出。没有修改系统外观、生产端口、Remote、Secret 或网页数据；未测试新版本在 macOS 26.0 实机上的显示。
+
+本轮 Xcode 构建、回归测试和 Debug 交付证据见 [TESTING.md](TESTING.md)。以下保留旧界面的历史观察，旧 Toolbar、回滚配置与导入说明已被后续用户要求替代。
+
+## 早期 Debug 界面（历史）
+
 日期：2026-10-23（Asia/Shanghai）。通过 CUA 的原生辅助功能树、实际菜单/快捷键操作及一次主窗口截图检查完成。验收对象为最终 Debug 构建：
 
 `build/Xcode/Build/Products/Debug/ZashDock.app`（相对于工程根目录）

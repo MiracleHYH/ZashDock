@@ -13,3 +13,6 @@ rm -rf "$app"
 ditto build/DebugApp/Build/Products/Debug/ZashDock.app "$app"
 codesign --verify --strict "$app"
 file "$app/Contents/MacOS/ZashDock"
+# Xcode registers its DerivedData product, not this copied trial App. Refresh only
+# this final bundle's metadata so Launch Services can discover its current icon.
+xcrun swift Scripts/register-debug-app.swift "$app"

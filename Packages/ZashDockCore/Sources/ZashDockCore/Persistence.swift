@@ -83,7 +83,7 @@ public struct ConfigurationLoadFailure: LocalizedError, Equatable, Sendable {
         switch kind {
         case .malformedJSON: "普通设置文件不是有效的 JSON；原文件已保留。"
         case .invalidFields: "普通设置文件缺少必要字段，或字段类型不正确；原文件已保留。"
-        case .invalidValues: "普通设置文件中的端口或历史保留数超出允许范围；原文件已保留。"
+        case .invalidValues: "普通设置文件中的当前端口或待清理端口无效；原文件已保留。"
         case .unreadable: "无法读取普通设置文件；请检查文件访问权限后重试。原文件未被覆盖。"
         case .missingPrimary: "普通设置文件已丢失；恢复副本和已有网页数据仍保留，请恢复原端口后继续。"
         }
@@ -113,13 +113,12 @@ public struct ConfigurationStore: Sendable {
         let fields: ConfigurationFields
         do { fields = try JSONDecoder().decode(ConfigurationFields.self, from: data) }
         catch { throw ConfigurationLoadFailure(kind: .invalidFields) }
-        guard (1024...65535).contains(fields.port), (0...100).contains(fields.maxRollbackVersions),
+        guard (1024...65535).contains(fields.port),
               fields.pendingOriginCleanup.map({ (1024...65535).contains($0) && $0 != fields.port }) ?? true else {
             throw ConfigurationLoadFailure(kind: .invalidValues)
         }
         var value = AppConfiguration()
         value.port = UInt16(fields.port)
-        value.maxRollbackVersions = fields.maxRollbackVersions
         value.quitAfterLastWindowCloses = fields.quitAfterLastWindowCloses
         value.pendingOriginCleanup = fields.pendingOriginCleanup.map(UInt16.init)
         value.legacyStorageImported = fields.legacyStorageImported
@@ -179,9 +178,6 @@ public struct ConfigurationStore: Sendable {
     }
     private func validate(_ configuration: AppConfiguration) throws {
         guard configuration.port >= 1024 else { throw ZashDockError.invalidConfiguration("端口必须在 1024–65535 之间。") }
-        guard (0...100).contains(configuration.maxRollbackVersions) else {
-            throw ZashDockError.invalidConfiguration("历史版本保留数必须在 0–100 之间。")
-        }
         guard configuration.pendingOriginCleanup.map({ $0 >= 1024 && $0 != configuration.port }) ?? true else {
             throw ZashDockError.invalidConfiguration("待清理的原端口必须有效，且不能等于当前端口。")
         }
@@ -198,18 +194,16 @@ public struct ConfigurationStore: Sendable {
 
     private struct ConfigurationFields: Decodable {
         let port: Int
-        let maxRollbackVersions: Int
         let quitAfterLastWindowCloses: Bool
         let pendingOriginCleanup: Int?
         let legacyStorageImported: Bool
 
         private enum CodingKeys: String, CodingKey {
-            case port, maxRollbackVersions, quitAfterLastWindowCloses, pendingOriginCleanup, legacyStorageImported
+            case port, quitAfterLastWindowCloses, pendingOriginCleanup, legacyStorageImported
         }
         init(from decoder: any Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             port = try fields.decode(Int.self, forKey: .port)
-            maxRollbackVersions = try fields.decode(Int.self, forKey: .maxRollbackVersions)
             quitAfterLastWindowCloses = try fields.decode(Bool.self, forKey: .quitAfterLastWindowCloses)
             pendingOriginCleanup = try fields.decodeIfPresent(Int.self, forKey: .pendingOriginCleanup)
             legacyStorageImported = fields.contains(.legacyStorageImported)
