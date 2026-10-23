@@ -7,7 +7,7 @@ let package = Package(
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0")
     ],
     targets: [
-        .executableTarget(name: "ZashDock", dependencies: ["ZashDockCore", .product(name: "Sparkle", package: "Sparkle")], path: "Sources/ZashDock"),
+        .executableTarget(name: "ZashDock", dependencies: ["ZashDockCore", .product(name: "Sparkle", package: "Sparkle")], path: "Sources/ZashDock", resources: [.process("Resources")]),
         .testTarget(name: "ZashDockIntegrationTests", dependencies: ["ZashDock", "ZashDockCore"], path: "Tests/ZashDockIntegrationTests")
     ]
 )

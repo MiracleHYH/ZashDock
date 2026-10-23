@@ -105,6 +105,8 @@ ad hoc Debug 构建重签名后代码身份会变化，系统可能要求重新�
 
 项目仓库为 [MiracleHYH/ZashDock](https://github.com/MiracleHYH/ZashDock)。ZashDock 自身通过固定版本的 **Sparkle 2.10.0** 接入此仓库的 GitHub Releases；原生应用菜单和“设置 → 更新”提供检查入口，自动检查默认关闭，可由用户开启。Zashboard 网页仍从上游官方仓库独立安装和更新。
 
+ZashDock 使用 MIT License；App 资源内保留本项目及 Sparkle 的完整许可文本，包含 Sparkle 所用组件的通知，“关于”页也提供许可链接。
+
 应用固定使用 `main/appcast.xml` 的 HTTPS 更新源，并要求更新源及更新包的 Ed25519 签名有效。公钥随应用发布，专用私钥不提交源码；签名失败不会在一段时间后自动回退为无签名 Feed。首次推送只提供签名的空更新源，不包含发布包或虚构版本。
 
 推送和 Pull Request 只触发构建、测试和 Debug 工件上传。正式发布须手动运行 `Publish signed ZashDock` 工作流并输入 `PUBLISH`，经过 Developer ID 签名、Apple 公证、装订和 Sparkle 签名后，才创建 GitHub Release 并更新 Feed。所需证书、仓库配置和失败恢复步骤见 [发布说明](Docs/RELEASING.md)。首次源码推送不会创建 Tag 或 Release。

@@ -114,6 +114,8 @@ struct SettingsView: View {
                 LabeledContent("Zashboard", value: model.currentVersion?.tag ?? "尚未安装")
                 Link("ZashDock 项目", destination: WrapperUpdateController.repositoryURL)
                 Link("ZashDock 发布版本", destination: WrapperUpdateController.releasesURL)
+                Link("ZashDock MIT License", destination: WrapperUpdateController.repositoryURL.appendingPathComponent("blob/main/LICENSE"))
+                Link("Sparkle 许可", destination: URL(string: "https://github.com/sparkle-project/Sparkle/blob/2.10.0/LICENSE")!)
                 Link("Zashboard 官方项目", destination: URL(string: "https://github.com/Zephyruso/zashboard")!)
                 Link("Zashboard MIT License", destination: URL(string: "https://github.com/Zephyruso/zashboard/blob/main/LICENSE")!)
             }.formStyle(.grouped).tabItem { Label("关于", systemImage: "info.circle") }
