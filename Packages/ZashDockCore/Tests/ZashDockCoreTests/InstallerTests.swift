@@ -3,7 +3,7 @@ import CryptoKit
 import Testing
 @testable import ZashDockCore
 
-private struct ZIPItem {
+struct ZIPItem {
     var path: String
     var data: Data
     var method: UInt16 = 0
@@ -11,7 +11,7 @@ private struct ZIPItem {
     var descriptor = false
     var crcOverride: UInt32?
 }
-private enum Fixture {
+enum Fixture {
     static func directory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ZashDockInstallerTest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

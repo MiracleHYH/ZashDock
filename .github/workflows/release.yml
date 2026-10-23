@@ -52,6 +52,14 @@ jobs:
             -configuration Debug -destination 'platform=macOS,arch=arm64' \
             -derivedDataPath build/ReleaseTests -resultBundlePath build/ReleaseTests.xcresult \
             CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES test
+          xcodebuild -project ZashDock.xcodeproj -scheme ZashDock \
+            -configuration Release -destination 'generic/platform=macOS' \
+            -archivePath build/ReleaseDiagnosticsTests.xcarchive \
+            -derivedDataPath build/ReleaseDiagnosticsTests \
+            -onlyUsePackageVersionsFromResolvedFile \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO archive
+          Scripts/test-release-diagnostics.sh build/ReleaseDiagnosticsTests.xcarchive
 
       - name: Publish the signed App and feed
         shell: bash
@@ -60,6 +68,7 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
           RELEASE_BUILD_NUMBER: ${{ inputs.build_number }}
           RELEASE_CONFIRM: ${{ inputs.confirm }}
+          RELEASE_DIAGNOSTICS_DIR: ${{ runner.temp }}/zashdock-release-diagnostics
           DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
           DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -68,3 +77,17 @@ jobs:
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: Scripts/release.sh --publish
+
+      # Keep an explicit whitelist if a later export/notary/publish step fails.
+      # Successful releases also attach these files as durable versioned assets.
+      - name: Retain matching symbols and build metadata
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/zashdock-release-diagnostics/*-dSYMs.zip
+            ${{ runner.temp }}/zashdock-release-diagnostics/*-build-metadata.json
+            ${{ runner.temp }}/zashdock-release-diagnostics/*-diagnostics-SHA256SUMS.txt
+          if-no-files-found: warn
+          retention-days: 90

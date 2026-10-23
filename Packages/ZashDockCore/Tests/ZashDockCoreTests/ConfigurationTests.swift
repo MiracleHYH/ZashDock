@@ -14,5 +14,5 @@ import Testing
     value.port = 80
     #expect(throws: (any Error).self) { try store.save(value) }
     #expect(try store.load().port == 12345)
-    #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["configuration.json"])
+    #expect(try Set(FileManager.default.contentsOfDirectory(atPath: directory.path)) == ["configuration.json", "configuration.last-valid.json"])
 }

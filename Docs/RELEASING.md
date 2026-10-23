@@ -57,17 +57,39 @@ Sparkle 公钥仅保存在应用 `Info.plist` 的 `SUPublicEDKey`，不再维护
 
 发行流程依次执行：
 
-1. 在尚未将发行凭据注入进程时重跑 Core 和实际 App 宿主测试；然后验证输入、必需凭据、默认分支、源码提交、现有标签和现有 Feed 签名，确认 Build 递增。
+1. 在尚未将发行凭据注入进程时重跑 Core 和实际 App 宿主测试，并对 ad-hoc Release Archive 执行符号工件安全回归；然后验证输入、必需凭据、默认分支、源码提交、现有标签和现有 Feed 签名，确认 Build 递增。
 2. 在临时 Keychain 导入 Developer ID Application 身份，Archive 后用 `developer-id` 方式导出。
 3. 检查原生签名、Team ID、hardened runtime、arm64 及实际 Bundle 版本，同时要求 Feed 验签失败不降级，并在解压更新前验签。
 4. 用 `notarytool` 提交临时 ZIP，要求 Accepted 并检查公证日志；对导出的 App staple 并验证，再重新生成最终 ZIP。此顺序符合 [Apple 公证和 Staple 流程](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)。
 5. 下载固定版本 **Sparkle 2.10.0** 官方工具并验证固定 SHA-256。复制原 Feed，使用 `generate_appcast` 签名新 ZIP 和 Feed；保留全部旧条目，关闭差分包生成，核对新条目的版本、长度和下载 URL，并使用 App 公钥独立验证最终 ZIP 的 EdDSA 签名。
-6. 创建草稿 Release，一次上传 `ZashDock-<version>-arm64.zip`、`appcast.xml` 和 `SHA256SUMS.txt`。全部验证完成才发布；启用仓库 Release immutability 时，GitHub 随即锁定资产及标签。此顺序遵循 [GitHub 不可变发行建议](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)。
+6. 创建草稿 Release，一次上传 `ZashDock-<version>-arm64.zip`、`appcast.xml`、`SHA256SUMS.txt`，以及下面说明的独立 dSYM ZIP、构建元数据与诊断摘要。全部验证完成才发布；启用仓库 Release immutability 时，GitHub 随即锁定资产及标签。此顺序遵循 [GitHub 不可变发行建议](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)。
 7. 再次检查 `main` 未变，将已签名 Feed 原样提交并正常 fast-forward 推送到 `main`，供应用检查更新。
 
 Feed 从官方 `generate_appcast` 自动获得 EdDSA 签名。**签名后不能重新排版、改变换行或手工修改 XML**；任何改动均需重新签名。Feed 生成与签名行为见 [Sparkle 官方文档](https://sparkle-project.org/documentation/)。旧条目未重新指向本次标签，历史 ZIP 仍使用各自按版本固定的 Release URL，脚本不会覆盖这些历史资产。
 
-临时证书、私钥、API Key、Keychain、Archive 和工具文件在脚本退出时清理。发行 Job 仅将三个明确列出的公开资产上传到 Release，不上传整个工作目录或私钥。首次真实 Developer ID 签名、公证、在线更新及发布流程必须在配置凭据并实际手动运行后才能记为通过；本次接入并未执行正式发布。
+临时证书、私钥、API Key、Keychain、Archive 和工具文件在脚本退出时清理。Archive 成功后立即另存匹配的 dSYM 和白名单构建元数据；后续导出、公证或发布失败也不会连带删除这些文件。发行 Job 只上传明确列出的公开资产，不上传整个工作目录、Archive 或私钥。首次真实 Developer ID 签名、公证、在线更新及发布流程必须在配置凭据并实际手动运行后才能记为通过；本次接入并未执行正式发布。
+
+## 崩溃符号与构建追溯
+
+每个成功发行还附带三个按版本、Build 和架构命名的资产：
+
+- `ZashDock-<version>-build<build>-arm64-dSYMs.zip`：主程序及静态链接 ZashDockCore 的匹配符号；不声称包含第三方 Sparkle 自身的符号。
+- `ZashDock-<version>-build<build>-arm64-build-metadata.json`：源码提交、应用版本和 Build、arm64 UUID、最低系统、Xcode/SDK 版本、归档程序与符号 SHA-256，以及工作流链接。
+- `ZashDock-<version>-build<build>-arm64-diagnostics-SHA256SUMS.txt`：前两项的摘要。
+
+这些是独立 Release 资产，随对应发行长期保留，避免依赖会到期的 Actions artifact。启用不可变发行后，它们与其他发行资产一同锁定。失败运行的诊断文件通过 `always()` 上传为 `release-diagnostics-<run>-<attempt>` artifact，保留 90 天；应在到期前下载调查需要的文件。工作流 artifact 可能因保留策略或运行记录删除而消失，不能充当永久符号仓库，参见 [GitHub artifact 保留规则](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts)。
+
+`prepare-release-diagnostics.swift` 先核对归档应用与 dSYM 的 arm64 UUID、Bundle ID、版本和 Build。ZIP 仅包含 DWARF 文件和重建的白名单 Info.plist；不复制任意附加文件、扩展属性、资源分支、环境变量、日志、证书、密钥或完整 Archive。诊断输出始终位于独立目录，**不会进入 `generate_appcast` 扫描的 updates 目录**。导出 App 后还会再次比较 UUID；签名和 Staple 可能改变文件摘要，因此符号配对以 UUID 为准，最终安装包摘要仍使用发行的 `SHA256SUMS.txt`。
+
+保留原始匹配 dSYM，不要为已发行版本重新编译并假定符号兼容。使用崩溃报告中的 UUID 选择对应资产；同一源码的另一轮构建也可能产生不同 UUID。操作依据见 [Apple 崩溃符号化说明](https://developer.apple.com/documentation/xcode/adding-identifiable-symbol-names-to-a-crash-report)。
+
+2026-10-23 已实际执行本机 ad-hoc arm64 Release Archive，结果 `ARCHIVE SUCCEEDED`，并运行：
+
+```sh
+Scripts/test-release-diagnostics.sh build/audit/release-diagnostics/ZashDock.xcarchive
+```
+
+7 项检查通过：实际 dSYM/程序 UUID、ZIP 内容和摘要/来源信息；现有输出保留；未知凭据参数拒绝；无效工作流信息拒绝且清除部分输出；缺失符号拒绝；符号链接拒绝；不同 arm64 程序 UUID 拒绝。测试额外放入虚构私钥文件、Info.plist 字段和扩展属性 canary，确认均未打包。构建及测试日志位于被忽略的 `build/audit/release-diagnostics/`。这次 Archive 包含开发中的修复，传入 HEAD 用于验证元数据格式与链路，不能当作已发行源码追溯记录；正式工作流会在构建前要求源码匹配 `GITHUB_SHA` 且跟踪文件干净。本轮未执行 `--publish`、公证、Tag 或 Release。
 
 ## 失败恢复
 

@@ -18,7 +18,7 @@ public enum ZashDockError: LocalizedError, Sendable {
 public struct AppPaths: Sendable {
     public let root: URL
     public var configuration: URL { root.appendingPathComponent("configuration.json") }
-    public var snapshot: URL { root.appendingPathComponent("storage.aesgcm") }
+    public var legacyStorage: URL { root.appendingPathComponent("storage.aesgcm") }
     public var versions: URL { root.appendingPathComponent("versions", isDirectory: true) }
     public var staging: URL { root.appendingPathComponent("staging", isDirectory: true) }
     public init(root: URL) { self.root = root }
@@ -71,23 +71,149 @@ public enum AtomicFile {
     }
 }
 
+/// Only wrapper preferences are covered by this error and its reset workflow.
+/// Encrypted website state, its key, and installed versions have separate recovery policies.
+public struct ConfigurationLoadFailure: LocalizedError, Equatable, Sendable {
+    public enum Kind: Equatable, Sendable {
+        case malformedJSON, invalidFields, invalidValues, unreadable, missingPrimary
+    }
+    public let kind: Kind
+    public init(kind: Kind) { self.kind = kind }
+    public var errorDescription: String? {
+        switch kind {
+        case .malformedJSON: "普通设置文件不是有效的 JSON；原文件已保留。"
+        case .invalidFields: "普通设置文件缺少必要字段，或字段类型不正确；原文件已保留。"
+        case .invalidValues: "普通设置文件中的端口或历史保留数超出允许范围；原文件已保留。"
+        case .unreadable: "无法读取普通设置文件；请检查文件访问权限后重试。原文件未被覆盖。"
+        case .missingPrimary: "普通设置文件已丢失；恢复副本和已有网页数据仍保留，请恢复原端口后继续。"
+        }
+    }
+}
+
 public struct ConfigurationStore: Sendable {
     public let url: URL
+    /// A small mirror of committed wrapper preferences; it never contains website storage.
+    public var recoveryCopyURL: URL { url.deletingPathExtension().appendingPathExtension("last-valid.json") }
     public init(url: URL) { self.url = url }
     public func load() throws -> AppConfiguration {
-        guard FileManager.default.fileExists(atPath: url.path) else { return AppConfiguration() }
-        let value = try AtomicFile.decode(AppConfiguration.self, from: url)
-        try validate(value)
+        guard let data = try readExisting() else {
+            // A prior mirror proves this is not a fresh profile. Never guess 9099 and
+            // show an empty Origin just because the primary metadata disappeared.
+            if FileManager.default.fileExists(atPath: recoveryCopyURL.path) {
+                throw ConfigurationLoadFailure(kind: .missingPrimary)
+            }
+            return AppConfiguration()
+        }
+        return try decode(data)
+    }
+
+    private func decode(_ data: Data) throws -> AppConfiguration {
+        do { _ = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }
+        catch { throw ConfigurationLoadFailure(kind: .malformedJSON) }
+        let fields: ConfigurationFields
+        do { fields = try JSONDecoder().decode(ConfigurationFields.self, from: data) }
+        catch { throw ConfigurationLoadFailure(kind: .invalidFields) }
+        guard (1024...65535).contains(fields.port), (0...100).contains(fields.maxRollbackVersions),
+              fields.pendingOriginCleanup.map({ (1024...65535).contains($0) && $0 != fields.port }) ?? true else {
+            throw ConfigurationLoadFailure(kind: .invalidValues)
+        }
+        var value = AppConfiguration()
+        value.port = UInt16(fields.port)
+        value.maxRollbackVersions = fields.maxRollbackVersions
+        value.quitAfterLastWindowCloses = fields.quitAfterLastWindowCloses
+        value.pendingOriginCleanup = fields.pendingOriginCleanup.map(UInt16.init)
+        value.legacyStorageImported = fields.legacyStorageImported
         return value
+    }
+
+    /// Explicit recovery only. Normal load never silently selects an older mirror or Origin.
+    public func recoverableConfiguration() -> AppConfiguration? {
+        guard let data = try? Data(contentsOf: recoveryCopyURL) else { return nil }
+        return try? decode(data)
+    }
+
+    /// Call before deleting the previous Origin. Failure leaves pendingOriginCleanup committed
+    /// so cleanup can retry later; it must not be reported as a failed port transaction.
+    public func ensureRecoveryCopy(_ configuration: AppConfiguration) throws {
+        try validate(configuration)
+        guard let data = try readExisting(), try decode(data) == configuration else {
+            throw ZashDockError.invalidConfiguration("只能为当前已提交的应用设置建立恢复副本。")
+        }
+        try AtomicFile.encode(configuration, to: recoveryCopyURL)
+    }
+
+    /// Requires an explicit user decision. A readable original is backed up before the
+    /// atomic replacement; an unreadable original is never overwritten without a backup.
+    @discardableResult
+    public func resetToDefaultsPreservingOriginal(_ defaults: AppConfiguration = AppConfiguration(), preservingPort: UInt16? = nil) throws -> URL? {
+        try validate(defaults)
+        let existing = try readExisting()
+        var recovered = defaults
+        if let origin = existing.flatMap({ try? decode($0) }) ?? recoverableConfiguration() {
+            recovered.port = origin.port
+            recovered.pendingOriginCleanup = origin.pendingOriginCleanup
+            recovered.legacyStorageImported = origin.legacyStorageImported
+        } else if let preservingPort {
+            guard preservingPort >= 1024 else { throw ZashDockError.invalidConfiguration("原端口必须在 1024–65535 之间。") }
+            recovered.port = preservingPort
+        } else {
+            throw ZashDockError.invalidConfiguration("无法确认原本地端口。请指定原端口后再恢复应用设置，以保留该 Origin 的网页数据。")
+        }
+        try validate(recovered)
+        let backup: URL?
+        if let existing {
+            let directory = url.deletingLastPathComponent().appendingPathComponent("configuration-recovery", isDirectory: true)
+            let destination = directory.appendingPathComponent("configuration-\(UUID().uuidString).json")
+            try AtomicFile.write(existing, to: destination)
+            backup = destination
+        } else { backup = nil }
+        try save(recovered)
+        return backup
     }
     public func save(_ configuration: AppConfiguration) throws {
         try validate(configuration)
         try AtomicFile.encode(configuration, to: url)
+        // The primary file above is the sole commit point. A failed mirror must not make
+        // the caller roll back an already committed port; cleanup explicitly retries it.
+        try? ensureRecoveryCopy(configuration)
     }
     private func validate(_ configuration: AppConfiguration) throws {
         guard configuration.port >= 1024 else { throw ZashDockError.invalidConfiguration("端口必须在 1024–65535 之间。") }
         guard (0...100).contains(configuration.maxRollbackVersions) else {
             throw ZashDockError.invalidConfiguration("历史版本保留数必须在 0–100 之间。")
+        }
+        guard configuration.pendingOriginCleanup.map({ $0 >= 1024 && $0 != configuration.port }) ?? true else {
+            throw ZashDockError.invalidConfiguration("待清理的原端口必须有效，且不能等于当前端口。")
+        }
+    }
+
+    private func readExisting() throws -> Data? {
+        do { return try Data(contentsOf: url) }
+        catch {
+            let failure = error as NSError
+            if failure.domain == NSCocoaErrorDomain, failure.code == NSFileReadNoSuchFileError { return nil }
+            throw ConfigurationLoadFailure(kind: .unreadable)
+        }
+    }
+
+    private struct ConfigurationFields: Decodable {
+        let port: Int
+        let maxRollbackVersions: Int
+        let quitAfterLastWindowCloses: Bool
+        let pendingOriginCleanup: Int?
+        let legacyStorageImported: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case port, maxRollbackVersions, quitAfterLastWindowCloses, pendingOriginCleanup, legacyStorageImported
+        }
+        init(from decoder: any Decoder) throws {
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            port = try fields.decode(Int.self, forKey: .port)
+            maxRollbackVersions = try fields.decode(Int.self, forKey: .maxRollbackVersions)
+            quitAfterLastWindowCloses = try fields.decode(Bool.self, forKey: .quitAfterLastWindowCloses)
+            pendingOriginCleanup = try fields.decodeIfPresent(Int.self, forKey: .pendingOriginCleanup)
+            legacyStorageImported = fields.contains(.legacyStorageImported)
+                ? try fields.decode(Bool.self, forKey: .legacyStorageImported) : false
         }
     }
 }

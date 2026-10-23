@@ -51,6 +51,18 @@ jobs:
             CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES test \
             2>&1 | tee build/verification/ci-xcodebuild.log
 
+      - name: Verify WebKit persistence across app processes
+        shell: bash
+        run: |
+          set -euo pipefail
+          Scripts/test-storage-processes.sh 2>&1 | tee build/verification/ci-storage-processes.log
+
+      - name: Verify AppModel restart after a committed port change
+        shell: bash
+        run: |
+          set -euo pipefail
+          Scripts/test-appmodel-processes.sh 2>&1 | tee build/verification/ci-appmodel-processes.log
+
       - name: Package the Debug App
         shell: bash
         run: |
@@ -81,6 +93,10 @@ jobs:
           path: |
             build/verification/ci-core.log
             build/verification/ci-xcodebuild.log
+            build/verification/ci-storage-processes.log
+            build/verification/ci-appmodel-processes.log
+            build/verification/storage-processes.*/
+            build/verification/appmodel-processes.*/
             build/CI-tests.xcresult
           if-no-files-found: warn
           retention-days: 7

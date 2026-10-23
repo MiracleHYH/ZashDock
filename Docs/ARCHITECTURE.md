@@ -1,62 +1,68 @@
 # ZashDock 架构
 
-本文描述 2026-10-23 源码的职责和事务边界。原生更新、回滚及端口事务已经过实际 App 宿主测试；执行结果与剩余限制见 [TESTING.md](TESTING.md)。
+本文描述 2026-10-23 当前源码。日常网页数据由 WebKit 持久化；原生只保存应用设置、官方发行元数据及网页资源版本。旧审计中出现的常驻存储桥接、原生加密快照和退出前 flush 已移除，不是现有架构。存储细节见 [STORAGE-DESIGN.md](STORAGE-DESIGN.md)，实际构建和验收边界见 [TESTING.md](TESTING.md)。
 
 ## 组件与并发隔离
 
-原生应用位于 `Sources/ZashDock`，可复用 Core 位于 `Packages/ZashDockCore`。本地 Core 通过 Swift Package Manager 接入 Xcode；`CZlib` 为系统 zlib 的 C 模块，不引入外部运行时或依赖安装脚本。
+应用使用 SwiftUI `Window`、独立 `Settings` Scene、`WebView`/`WebPage`、Swift Concurrency 和 `@Observable`。目标为 macOS 26+、arm64。Core 以本地 Swift Package 接入 Xcode；ZIP 解压使用系统 zlib，Wrapper 更新通过 SwiftPM 接入 Sparkle。不引入 Node.js、Electron、Tauri、Docker 或 Mihomo Kernel。
 
 | 组件 | 隔离方式 | 职责 |
 | --- | --- | --- |
-| `AppModel` | `@MainActor @Observable` | 应用状态、安装编排、端口事务、退出前保存 |
-| `WebSession` | `@MainActor @Observable` | 创建持久化 WebPage、加载与渲染验证、存储刷新 |
-| `ZashboardStorageBridge` | `@MainActor` | 文档开始恢复、消息验证、快照顺序和持久化队列 |
-| `ZashboardUpdateManager` | `@MainActor @Observable` | 下载进度、取消、发行检查、准备与显式提交 |
-| `ReleaseClient` | `actor` | 官方元数据、受限 HTTPS 下载、大小与 SHA-256 验证 |
-| `VersionStore` | `actor` | 版本目录、文件清单、当前指针、历史顺序与清理 |
-| `StorageSnapshotVault` | `actor` | AES-GCM 快照、认证备份和失败恢复 |
-| `LoopbackHTTPServer` | 主线程入口、内部串行队列 | 绑定、连接生命周期、受限静态文件读取与流式发送 |
+| `AppModel` | `@MainActor @Observable` | 启动状态、安装编排、端口与版本事务 |
+| `WebSession` | `@MainActor @Observable` | 创建网页、渲染与服务身份验证、运行时错误处理 |
+| `OriginStorageTransfer` | `@MainActor` | 可信空文档中的限额读取、恢复、核验和提交后清理 |
+| `WebInteractionCoordinator` | `@MainActor` | 原生网页对话框、文件选择与受限导出 |
+| `LegacyWebStorageReader` | `Sendable` 值类型 | 一次性只读兼容旧 AES-GCM LocalStorage 文件 |
+| `ZashboardUpdateManager` | `@MainActor @Observable` | 官方网页版本检查、下载进度、取消、准备和清理 |
+| `ReleaseClient` | `actor` | 官方 HTTPS 元数据、资产来源、大小与 SHA-256 验证 |
+| `VersionStore` | `actor` | 版本目录、内容清单、当前指针、历史顺序和清理报告 |
+| `LoopbackHTTPServer` | 主线程入口、内部串行队列 | loopback 绑定、受限静态文件读取与流式发送 |
 | `SafeZIPExtractor` | 无共享可变状态的值类型 | ZIP 结构、路径、资源上限、解压和 CRC 校验 |
-| `ConfigurationStore` / `AtomicFile` | 同步值类型和工具 | 配置验证、同目录临时文件、原子替换 |
+| `ConfigurationStore` / `AtomicFile` | 同步值类型和工具 | 普通配置验证、原子提交与小型恢复镜像 |
+| `WrapperUpdateController` | `@MainActor @Observable` | ZashDock 自身的 Sparkle 签名更新入口 |
 
-服务内部 `StaticServerCore` 与连接对象通过独立串行 DispatchQueue 管理，不把它们称为 Swift actor。`@unchecked Sendable` 的正确性依赖该队列约束，跨队列入口通过排队或同步进入。
+HTTP 服务内部对象由独立串行 DispatchQueue 管理，不是 Swift actor。其 `@unchecked Sendable` 依赖队列约束。AppModel 串行化安装、端口与版本操作；下载阶段可继续显示旧网页，替换网页前卸载旧 JavaScript 和连接，再停止旧监听器，任何时刻最多一个本地 HTTP 监听器。
 
-SwiftUI 使用独立 `Window` 和 `Settings` Scene。主窗口按 `starting`、`uninstalled`、`installing`、`ready`、`damaged`、`unavailable` 展示原生状态或 WebView。AppDelegate 处理 Dock 重开和退出前异步保存；用户可配置关闭最后窗口后退出。系统窗口恢复及菜单的人工验收与自动测试分开记录。
+主窗口按启动、未安装、安装中、就绪、安装损坏、服务不可用或配置恢复状态呈现原生内容。没有有效安装时不会进入空白 WebView。AppDelegate 处理 Dock 重开、关闭最后窗口后的行为以及退出时取消/等待当前操作、卸载页面和停止服务；没有原生 Remote 保存队列或保存失败退出选项。
 
-## 持久化布局
+## 持久化布局与权威来源
 
-`AppPaths.application()` 使用系统 Application Support 目录，并追加稳定标识 `app.zashdock.mac`。启用 App Sandbox 时由系统映射到应用容器，不在代码中硬编码容器绝对路径。
+`AppPaths.application()` 取得 Application Support 后追加稳定标识 `app.zashdock.mac`。App Sandbox 下由系统映射到容器，代码不硬编码容器路径。
 
 ```text
 <Application Support>/app.zashdock.mac/
-  configuration.json
-  official-releases.json
-  versions-state.json
-  storage.aesgcm
-  storage.aesgcm.backup
-  versions/
-    <tag>-<digest-prefix>[-<repair-id>]/
-      manifest.json
-      content/
-        index.html
-        assets/...
-  staging/
-    <temporary downloads and extraction directories>
+  configuration.json                 # 普通设置，唯一端口提交点
+  configuration.last-valid.json      # 已提交普通设置的小型恢复镜像
+  configuration-recovery/...         # 用户显式恢复前保全的原设置文件
+  official-releases.json             # 可信官方发行元数据缓存
+  versions-state.json                # 当前资源指针、激活顺序、清理报告
+  versions/<version-id>/
+    manifest.json
+    content/index.html
+    content/assets/...
+  staging/...                        # 未完成下载与解压
+  storage.aesgcm[.backup]             # 仅已有旧安装可能存在，只读兼容
+
+WebKit 默认持久 DataStore（位置由 WebKit 管理）
+  http://127.0.0.1:<当前端口>
+    LocalStorage
+    IndexedDB: base64 / connection-history
+    其他由 WebKit 管理的网站数据
 ```
 
-`configuration.json` 保存端口、历史数量和窗口行为，不包含 Remote Secret。`official-releases.json` 缓存通过官方 API 获得的发行摘要元数据。版本内容、安装清单、版本指针和存储快照各自独立，HTTP 服务仅打开 `content/`，不会把配置或备份目录作为站点根目录。
+`configuration.json` 仅包含端口、历史保留数、窗口行为、`pendingOriginCleanup` 和 `legacyStorageImported`，不含 Remote、Secret 或网页配置。正常加载只读主文件，不自动选择恢复镜像。镜像用于原生界面显式恢复原端口，不能成为另一份 Remote 数据源。
 
-`AtomicFile` 在目标同目录创建权限为 `0600` 的临时文件，写入并同步，随后通过 `rename` 原子替换目标，并同步父目录。受管目录使用 `0700`。版本状态和端口配置都使用此路径，不直接覆盖正式文件。
+`save` 原子写入主文件后，尽力更新镜像；镜像失败不能把已经提交的端口报告为失败。清理旧 Origin 前必须先成功 `ensureRecoveryCopy`。因此镜像滞后时，它指向的旧业务数据仍保留。主文件损坏或丢失但有镜像时进入恢复界面；没有有效端口元数据时由用户指定原端口，不静默改用 9099。
 
-## 官方发行与安装事务
+`AtomicFile` 使用同目录、`0600` 临时文件，写入同步后 `rename` 替换并尝试同步父目录；受管目录使用 `0700`。HTTP 根目录仅为所选版本的 `content/`，不暴露配置、旧密文或恢复镜像。
 
-`ReleaseClient` 访问固定官方 GitHub API，排除 draft 和 prerelease，精确选择名为 `dist.zip` 且提供 SHA-256 的已上传资产。初始资产 URL 必须为官方仓库对应标签的 HTTPS 发行地址。API 与下载分别使用临时 URLSession，检查每次重定向和最终 URL；不接受第三方源，也不将 Remote 配置附加到请求。
+## 安装与资源验证
 
-下载流以小缓冲增量写入和计算 SHA-256，核对声明大小、实际大小和 digest，取消或失败删除未完成下载。离线导入以可信摘要目录识别文件；内置的 v3.29.1 seed 只有发行元数据，不包含 ZIP。损坏的缓存目录不会使内置 seed 失效。无法匹配可信摘要的 ZIP 会被拒绝。
+Bundle 不包含 Zashboard dist。首次安装和手动更新使用 Zephyruso/zashboard 官方稳定 Release，排除 draft/prerelease，精确选择带可信 SHA-256 的 `dist.zip`。URLSession 为临时会话，入口、每次重定向和最终 URL 均验证 HTTPS 与官方 GitHub 资产来源。下载增量写入并计算摘要，核对声明及实际大小；取消和失败删除临时下载。
 
-`BoundedZIPInput` 在复制前以 `O_NOFOLLOW` 打开源文件并确认是大小匹配的普通文件，限制复制字节数，检查文件身份、增长和修改。随后再次校验私有副本摘要，避免识别与复制之间替换外部文件导致无界复制。
+本地 ZIP 通过已缓存的可信官方摘要或内置 v3.29.1 发行摘要识别。内置内容只有元数据，没有网页资源。未知摘要的离线归档不能因名称或结构相同而获得官方身份。`BoundedZIPInput` 以 `O_NOFOLLOW` 打开普通文件、限额复制并检查身份/修改，再校验私有副本摘要。
 
-`SafeZIPExtractor` 先验证归档记录，再写入新的私有 staging 目录。当前限制如下：
+`SafeZIPExtractor` 先验证记录，再写入新的私有 staging 目录：
 
 | 项目 | 上限 |
 | --- | --- |
@@ -66,109 +72,66 @@ SwiftUI 使用独立 `Window` 和 `Settings` Scene。主窗口按 `starting`、`
 | 条目数 | 20,000 |
 | 单条目压缩比 | 250 |
 
-解析器核对中央目录、本地头、UTF-8 名称、数据描述符、连续且无重叠的文件记录和 CRC；拒绝 ZIP64、加密归档、特殊文件、符号链接、绝对路径、`..`、反斜杠、含糊编码、Unicode/大小写冲突和父文件路径冲突。只有必需入口和 JavaScript 资源有效，才会生成候选安装清单。
+解析器验证中央目录、本地头、UTF-8 名称、数据描述符、记录边界及 CRC，拒绝 ZIP64、加密、特殊文件、符号链接、路径穿越、重复及大小写/Unicode 冲突。只有 `index.html` 与必要 JavaScript 资源有效，才生成含文件大小和 SHA-256 的 `manifest.json`。读取/激活已安装版本也验证实际文件；目录存在不等于安装有效。
 
-`manifest.json` 记录 schema、版本 ID、官方发行元数据、安装时间，以及每个内容文件的相对路径、大小和 SHA-256。`VersionStore` 在激活和读取时验证清单与文件内容；损坏的已安装版本不能仅凭目录存在进入 WebView。
+校验后的候选移入版本目录，尚不改变当前指针。staging 和未激活候选不计入历史；失败不会预删旧版。网页代码预检和资源提交顺序见下文。
 
-候选完成校验后移入独立版本目录，但此时仍不是当前版本。`versions-state.json` 中的 `currentID` 是原子提交点；准备失败不修改指针，也不预先删除旧版。启动时清理 staging 的中断任务，未激活候选不进入历史列表。
+## 本地 HTTP 与 WebKit 边界
 
-## 本地 HTTP 服务
+`NWListener` 仅绑定 `127.0.0.1:<port>`，关闭端点重用和点对点接口，收到 `.ready` 并核对端口后才算绑定成功。连接还验证 IPv4 loopback 对端。HTTP 只支持 GET/HEAD，要求精确 Host；存在 Origin 时须匹配当前站点。拒绝跨站请求、Service Worker 脚本请求、重复标头、请求体和 Transfer-Encoding。头部限 16 KiB、目标限 4096 字节、连接限 32，并设读写期限。
 
-`NWListener` 明确绑定 `127.0.0.1:<port>`，不绑定通配地址或 IPv6 外部接口，禁用端点重用和点对点接口。只有监听器报告 `.ready` 且端口匹配，`start()` 才返回。接受连接时再次验证 IPv4 loopback 对端。
+路径只解码一次；持有根目录描述符，通过逐级 `openat`/`O_NOFOLLOW` 访问目录与普通文件，复核身份、长度及修改，避免逃出受管目录。文件按 64 KiB 块发送，全局待发块预算 2 MiB。只有无扩展名路径可回退 `index.html`，资源缺失返回 404。响应包含明确 MIME、`nosniff`、`no-store` 和无 Referrer 策略。
 
-HTTP 层只支持 GET/HEAD，要求精确 `Host: 127.0.0.1:<port>`；出现 Origin 时必须与当前站点完全一致，拒绝 `Sec-Fetch-Site: cross-site`、Service Worker 脚本请求、重复标头、请求体和 Transfer-Encoding。请求头限制 16 KiB，目标限制 4096 字节，连接数限制 32，并设置读取及发送期限。
+唯一动态路由 `/__zashdock_health` 返回版本 ID 与启动 nonce，用于核验当前绑定实例。服务器没有命令执行、文件写入、配置修改、远程 HTTP 代理端点。
 
-路径只解码一次，拒绝目录穿越和含糊分隔符。根目录被打开为持有的文件描述符；后续通过逐级 `openat` 和 `O_NOFOLLOW` 查找文件，中间组件要求目录，最终组件要求普通文件。文件身份、长度和修改时间在读取期间复核，避免符号链接替换或文件变化被当作正常静态响应。
+生产 `WebSession` 使用 `WKWebsiteDataStore.default()`。网页自己正常读写 LocalStorage/IndexedDB；原生不包装 Storage 方法、不周期轮询、不接收 Remote 快照、不在 reload 时回放 seed。加载验证等待 `#app` 实际内容并核验版本/nonce；持续观察 `WebPage.navigations`，运行时失败显示原生重新载入入口。
 
-静态文件使用每连接最多一个 64 KiB 块的流式发送，全局待发送文件块预算为 2 MiB；发送完成后才读取下一块。HEAD 只取元数据，不读取整个文件。所有响应带明确 MIME、`nosniff`、`no-store`、无 Referrer 和同源资源策略。只有不含扩展名的缺失路径可回退到 `index.html`，资源缺失返回 404。
+本地精确 Origin 的主框架导航可留在应用内，外部 HTTP/HTTPS 主框架导航交系统浏览器。该策略不是 REST/WebSocket 子资源过滤器。官方网页直接连接 Mihomo；连接的 CORS、认证、TLS 与网络路由仍由浏览器和远端约束。
 
-唯一内置动态路由 `/__zashdock_health` 返回当前服务的版本 ID 和本次启动 nonce，供原生验证实例。该 nonce 用于识别绑定实例，不是对外的通用授权或远程管理接口。服务没有命令执行、文件写入、配置修改或远程 HTTP 代理端点。
+`WebInteractionCoordinator` 保留有限的文件交互脚本，区别于已删除的存储桥接。消息验证内容世界、主框架、SecurityOrigin、格式、MIME、文件名及数据大小，导出需一次真实手势，位置仅由原生保存面板返回。文档切换/恢复撤销旧授权、取消面板，并在异步返回后验证文档代次；不提供任意路径写入或命令能力。
 
-## WebKit 页面与导航
+## 端口事务
 
-`WebSession` 使用 macOS 26 的 `WebPage` 和 SwiftUI `WebView`，配置 `WKWebsiteDataStore.default()` 持久保存网页数据。它通过 `WebPage.Configuration.userContentController` 直接接入存储脚本，无需包装旧式 NSView WebView。
+默认 9099，用户可输入 1024–65535；自动选择仅由明确按钮触发，在 9099–9198 中实际尝试绑定，成功后持久保存。没有静默换端口。
 
-页面导航只允许本地精确 Origin；外部用户点击的 HTTP/HTTPS 链接交给 `NSWorkspace` 打开。子框架导航不获得原生桥接信任。网页导出使用的 Blob 下载是独立处理边界，不允许把任意 `file:`、自定义 scheme 或本地文件路径交给网页。
+`AppModel.changePort` 的顺序为：
 
-加载验证不仅等待主文档完成，还等待 `#app` 出现实际内容，检查健康路由返回的版本和 nonce，并核验文档开始阶段的存储恢复确认。网络完成不等于 Vue 初始化完成；错误或空白候选不能仅凭空 `#app` 被激活。
+1. 完成必要的一次性旧密文导入；若上次仍待清理旧 Origin，先完成该清理，避免覆盖标记。
+2. 卸载网页、停止旧监听器。通过可信模拟响应读取旧 Origin 的完整 LocalStorage 及两种受支持业务 IndexedDB 到临时内存，不请求旧端口。
+3. 实际绑定目标端口，在目标 Origin 恢复并读回核验；已有安装时加载官方页面，验证渲染及服务身份。
+4. 原子保存新端口和 `pendingOriginCleanup=旧端口`，这是唯一持久提交点。
+5. 采用新页面/服务。先确保当前普通配置恢复镜像可用，再清空旧 Origin 的 LocalStorage 和两个业务 objectStore，最后清除待清理标记。
 
-## LocalStorage 桥接与消息协议
+提交前失败关闭候选，尝试清空未提交目标并恢复旧服务；旧配置与源 Origin 不清除。提交后清理失败保留新配置及标记，下次启动重试，不把操作谎报为端口未改变。清空不删除 IndexedDB schema，也不删除 Cookie 等未迁移数据。WebKit 的这些多步写入不是跨数据库原子事务；安全性来自提交前保留源数据及提交后幂等清理。
 
-`ZashboardStorageBridge` 只处理当前 `http://127.0.0.1:<port>` 的主框架。`WKUserScript` 在 `.atDocumentStart`、`.page` 世界注入；有快照时同步清空并恢复 LocalStorage，之后才允许官方应用脚本读取。`nil` seed 表示尚无原生快照，保留现有 Origin 数据；空字典表示真实的已保存空配置，两者不能混同。
+旧端口被别的程序占用时，同一持久 DataStore 中的可信 `load(simulatedRequest:responseHTML:)` 文档仍可访问旧 Origin；实测路径不会向占用者发送请求。迁移仅覆盖当前已知官方业务格式，发现未知数据库/schema 或超限数据则提交前停止，详见存储文档。
 
-脚本保存初始恢复确认，包装 `Storage.prototype.setItem`、`removeItem`、`clear`，监听 storage/pagehide，并每 250 ms 比较完整键值，以覆盖属性赋值等写入路径。网页只提交完整字符串字典，不能选择原生路径、调用系统命令或请求任意网络转发。
+## 更新、回滚与历史清理
 
-原生消息必须同时满足固定通道、`.page` 世界、主框架、精确 SecurityOrigin，以及严格字段集合：
+资源版本与网页数据分离，更新/回滚保持同一端口和持久 DataStore。没有随版本保存或回放用户配置。
 
-```text
-schema = 1
-token = 当前桥接会话标识
-kind = restoreAck | snapshot
-sequence = 非负、JavaScript 安全范围内的整数
-snapshot = [String: String]
-```
+1. 下载、解压、清单及文件验证完成后卸载旧网页，停止旧监听器。
+2. 读取当前业务数据到内存；候选服务绑定同一端口，将数据恢复到新建 `.nonPersistent()` DataStore，在其中执行候选官方网页并验证渲染及服务身份。
+3. 预检成功、取消检查通过后，原子提交 `versions-state.json` 的当前资源指针。
+4. 清理持久容器中的可丢弃缓存，启动当前版本的持久 live 页面。此时才允许新网页在真实数据上执行自身迁移。
+5. live 页面验证成功后执行历史清理。
 
-拒绝布尔值冒充 schema/sequence、额外字段、错误会话、非字符串键值、过期序号和超限消息。限制为最多 4096 个键、单键 16 KiB、单值 4 MiB、序列化数据及消息最多 8 MiB。会话 token 用于关联消息，不能当作对受信同源网页隐藏的秘密；真正的边界是受控来源、主框架和有限能力。
+提交前失败不会让候选代码接触持久网页数据，恢复原服务/页面，保留原资源指针。指针提交后 live 失败则保留新指针和历史资源，显示重载入口，**不自动回退指针，也不清理历史**。因为新代码此时可能已修改持久数据，不能承诺资源回退等于网页数据回滚。手动回滚也需预检；上游数据 schema 的向后兼容性仍有实际边界。
 
-消息按顺序排队交给 Vault。显式 `flush` 主动捕获最新状态，等待先前保存，持续排空写入期间到达的新修订，完成后才能报告最新快照已持久化。错误只报告分类信息，不输出 LocalStorage 内容、后端 URL 或 Secret。
+历史按激活顺序维护，回滚也是一次激活。`maxRollbackVersions=N` 默认 1、范围 0–100，不含当前版本。清理先验证健康历史再保留最近 N 个；损坏历史不挤占名额，有明确清理/损坏报告。当前及显式保护的活跃版本不删除，短暂保护解除后再执行上限。权限、枚举错误或取消不能伪装成损坏并删除。清理仅作用于资源版本目录，不触及网页数据、旧密文或普通设置。
 
-## AES-GCM 与 Keychain
+## 缓存、安全与发布边界
 
-Vault 将全部 LocalStorage 字符串字典序列化，以随机 256 位密钥使用 AES-GCM 加密。固定头 `ZASHDOCK-SNAPSHOT-1` 同时作为认证附加数据；密文保存 nonce 和认证 tag。主密文及 backup 通过原子文件写入，轮换前必须先成功认证旧快照。
+官方包包含 PWA 注册与 Workbox 缓存。`WebCacheController` 仅对本应用 DataStore 中 loopback 记录删除 Service Worker 注册、Fetch Cache、磁盘及内存缓存；不调用全类型清理，不删除 LocalStorage、IndexedDB、Cookie 或凭据。站点记录粒度不是精确端口选择器，因此不声称只清某个端口缓存。服务器同时拒绝新的 Service Worker 脚本加载。
 
-生产密钥由 Keychain 保存，service 为 `app.zashdock.mac.storage`，account 为 `primary`，不启用同步或共享 access group，访问属性为 `AfterFirstUnlockThisDeviceOnly`。已有密文但取不到密钥时，不能创建新密钥覆盖，也不能回退到明文。
+Bundle ID 固定 `app.zashdock.mac`。Sandbox 允许 network.client/server 和用户选定文件读写；Sparkle 使用其所需的命名 Mach 服务例外。原生 GitHub 请求保持 ATS，并独立验证官方来源。Info.plist 有 loopback HTTP、本地网络及 WebKit 专用 `NSAllowsArbitraryLoadsInWebContent` 例外，以支持用户运行时配置的任意 HTTP Remote；该范围宽于 loopback，不等于全局关闭 ATS，也不绕过 CORS 或 TLS 验证。HTTP/WS 上的凭据仍是明文传输。
 
-读取主快照失败时只尝试经过认证的备份；恢复成功返回明确状态，提示最近一次更改可能需要重新输入。主备份都无效时抛出错误，保留原数据。测试通过可注入密钥提供者覆盖 AES 完整性、错误密钥、轮换和恢复；这与生产 Keychain 权限的实际运行验收分别记录。
+旧密文兼容器只读取已有 Keychain 密钥并认证旧文件，不生成密钥、写新密文、轮换或修复原文件。成功恢复并核验 WebKit 后才提交一次性标记；失败保留文件和标记，允许重试。新安装没有旧文件就不访问 Keychain。WebKit 自身数据不增加原生应用层加密。
 
-加密覆盖的是原生独立快照和备份。WebKit 自己的 LocalStorage/IndexedDB 仍由系统持久化；本文不声称对整个 WebsiteDataStore 提供额外的应用层加密。
+Zashboard 网页更新来自 Zephyruso/zashboard；ZashDock 应用更新来自 MiracleHYH/ZashDock 的 Sparkle 签名发布包，两条流程分离。Mihomo `/upgrade/ui` 不管理本地资源，ZashDock 的更新流程不调用它。签名和发布要求见 [RELEASING.md](RELEASING.md)，本轮开发不创建 Release。
 
-## 端口迁移事务
+## 验证范围
 
-`AppModel.changePort` 以 `configuration.json` 的原子写入作为提交点：
+Core 覆盖 ZIP、资源历史、普通元数据和只读旧文件兼容；App 宿主覆盖两个官方格式 Remote、选中项、业务 IndexedDB、旧端口被占、目标绑定/元数据失败、清理重试、更新回滚、缓存和原生交互。测试使用隔离临时目录及 DataStore，不操作生产 Remote 或 Keychain。
 
-1. 刷新旧页面，持久保存最新完整 LocalStorage；暂停旧桥接的自动保存。
-2. 加载独立快照，在保留旧监听器的同时实际绑定候选端口。
-3. 创建默认不自动持久化的候选桥接，在文档开始阶段恢复到新 Origin。
-4. 验证页面渲染、服务版本/nonce、初始恢复确认，并捕获候选最新状态。
-5. 原子保存候选端口；至此事务提交。
-6. 停止旧页面和服务，采用候选页面，启用其保存并刷新快照。
-
-提交前失败会关闭候选并恢复旧桥接，原端口配置和独立快照保持不变。提交后的快照写入失败显示错误，不把已经保存的端口谎报为未提交。自动选择只由明确按钮触发，探测成功并验证后同样保存配置。
-
-当应用刚启动、旧端口已被其他程序占用时，没有可读取的旧 WebPage 也能迁移：原生 Vault 在启动时独立加载，事务使用该快照恢复到新 Origin，而不连接占用旧端口的其他程序。
-
-**当前限制：没有实现 IndexedDB 跨端口迁移。** 官方的本地背景图数据库 `base64` 和连接历史数据库 `connection-history` 留在旧 Origin。LocalStorage 中的相关设置值会迁移，不能据此声称背景图二进制数据或完整 Origin 也已迁移。单纯重写 WebKit 导出数据中的 Origin 不属于本实现。
-
-## 版本历史与切换事务
-
-Core 的版本激活和清理已分离。历史列表按最近激活顺序排列，不按标签字符串或目录修改时间猜测。激活时将目标移到激活序列末尾；回滚仍是一次经过文件验证和网页验证的显式激活。
-
-`maxRollbackVersions = N` 默认 1，配置范围 0–100，N 不包括当前版本。成功操作完成后保留当前及最近 N 个历史版本，总数不超过 N + 1。`protecting` 集合用于短暂保护仍被服务引用的目录；引用释放后必须再次清理，不能让暂时保护永久突破上限。清理范围仅限 versions，不触及 Vault、配置或 WebKit 用户数据。
-
-下载和解压期间旧网页继续工作。在停用旧网页前刷新快照、卸载旧 JavaScript 上下文，再绑定同一端口并验证候选。验证完成才提交当前指针并清理历史。失败会在独立于取消状态的新任务中恢复旧服务与旧页面，保留原快照和版本指针。实际测试同时检查 DOM、初始化首读、服务 nonce、版本指针字节和历史顺序。
-
-Mihomo `/upgrade/ui` 修改的是远程内核的面板，与本地版本目录没有关系；ZashDock 更新流程不调用该接口。
-
-## PWA 与缓存边界
-
-官方发行包含自动注册的 Service Worker 和缓存 `index.html` 的 Workbox 预缓存。`Cache-Control: no-store` 不能单独证明已显示新版。
-
-`WebCacheController` 在创建替代页面前，仅选择 displayName 为 loopback 的 WebsiteDataRecord，并清除 Service Worker 注册、Fetch Cache、磁盘缓存和内存缓存。不会调用 `allWebsiteDataTypes()`，也不会删除 LocalStorage、IndexedDB、Cookie 或凭据。HTTP 服务同时拒绝新的 Service Worker 脚本加载。
-
-WebKit 的站点记录不提供任意精度的端口级筛选，因此该处理范围是此应用数据存储中的 loopback 缓存记录，而非声称只删除某个单独端口。实际版本显示、回滚、重启和旧控制器退出需要运行用例验证。
-
-## Sandbox、ATS 与 Remote 网络
-
-Bundle ID 固定 `app.zashdock.mac`。entitlements 启用 App Sandbox、network.client、network.server，以及用户选择文件的只读访问。ZIP 导入只在选定文件作用域有效期间读取，不授予网页文件系统能力。
-
-Info.plist 包含 loopback HTTP 例外和 `NSAllowsLocalNetworking`。由于原版网页必须直接连接用户运行时配置的任意 HTTP Remote，固定域名例外无法穷举这些后端；因此还配置 WebKit 专用的 `NSAllowsArbitraryLoadsInWebContent`。这项例外覆盖应用内 WebKit 请求，范围宽于 loopback，必须明确说明，而不能称为仅允许本地 HTTP。
-
-没有配置全局 `NSAllowsArbitraryLoads`。原生 GitHub URLSession 保留 ATS，并主动执行 HTTPS、官方仓库、资产和重定向校验。WebKit 例外不关闭 CORS、同源策略或 TLS 认证；明文 HTTP/WS 的凭据仍是明文传输，HTTPS/WSS 的保护需要远程服务支持。分发到 App Store 时还需按 Apple 文档说明该例外的用途。
-
-远程 REST 和 WebSocket 由官方网页直接发出。REST 认证头触发正常 CORS 预检；WebSocket 使用远端 URL 上的 token 查询参数。应用不记录这些完整请求，不进行远程代理转发，也不修改 Surge、VPN 或系统路由。公开端点返回 401 只能证明连通性，不能记为认证或订阅成功。
-
-## 验证入口
-
-Core 测试位于 `Packages/ZashDockCore/Tests`，WebKit 与原生事务集成测试位于 `Tests/ZashDockIntegrationTests`。用例包含 ZIP/历史/快照安全边界、两个 Remote 的恢复、跨 Origin HTTP 预检和真实 WebSocket 握手。测试 fixture 的键、Remote 和 token 都是虚构数据。
-
-构建采用实际 Xcode 工程和本地 SwiftPM Core。Xcode 27.1 的 arm64 Debug 构建已经成功；每阶段运行结果、未执行项及真实网络记录集中在 [TESTING.md](TESTING.md)，不以测试函数存在或 mock 通过代替全部验收。
+实际执行结果、跨进程证据及未执行项集中在 [TESTING.md](TESTING.md)。API 的 macOS 26 availability 和 SDK 编译不代表已在 macOS 26 实机或系统重启后验收；当前运行证据来自 macOS 27.0.1。历史 [AUDIT-2026-10-23.md](AUDIT-2026-10-23.md) 是问题发现时的记录，现状以当前源码和修复记录为准。

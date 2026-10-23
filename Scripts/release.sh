@@ -54,10 +54,17 @@ tag="v$RELEASE_VERSION"
 asset_name="ZashDock-$RELEASE_VERSION-arm64.zip"
 asset_url="https://github.com/$repository/releases/download/$tag/$asset_name"
 feed_url="https://raw.githubusercontent.com/$repository/main/appcast.xml"
+diagnostics_basename="ZashDock-$RELEASE_VERSION-build$RELEASE_BUILD_NUMBER-arm64"
+diagnostics_dir="${RELEASE_DIAGNOSTICS_DIR:-$PWD/build/ReleaseDiagnostics/$tag-build$RELEASE_BUILD_NUMBER}"
+[[ "$diagnostics_dir" == /* && ! -e "$diagnostics_dir" ]] || fail 'release diagnostics need a fresh absolute output directory'
+diagnostics_zip="$diagnostics_dir/$diagnostics_basename-dSYMs.zip"
+diagnostics_metadata="$diagnostics_dir/$diagnostics_basename-build-metadata.json"
+diagnostics_checksums="$diagnostics_dir/$diagnostics_basename-diagnostics-SHA256SUMS.txt"
 assert_current_main
 assert_unused_release
 
 release_temp=$(mktemp -d "${RUNNER_TEMP:?}/zashdock-release.XXXXXX")
+[[ "$diagnostics_dir" != "$release_temp" && "$diagnostics_dir" != "$release_temp/"* ]] || fail 'diagnostics must survive outside the temporary signing directory'
 keychain="$release_temp/signing.keychain-db"
 original_keychains=()
 while IFS= read -r keychain_line; do
@@ -179,6 +186,14 @@ xcodebuild -project ZashDock.xcodeproj -scheme ZashDock -configuration Release \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$identity" \
   OTHER_CODE_SIGN_FLAGS="--keychain $keychain" ENABLE_HARDENED_RUNTIME=YES CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO archive
 
+# Preserve matched symbols immediately after a successful archive, even if export,
+# notarization, feed generation, or publication later fails. This separate directory
+# survives cleanup and is never scanned by Sparkle's generate_appcast.
+diagnostics_args=(--archive "$release_temp/ZashDock.xcarchive" --output "$diagnostics_dir"
+  --source-commit "$source_commit" --version "$RELEASE_VERSION" --build-number "$RELEASE_BUILD_NUMBER"
+  --workflow-run-id "${GITHUB_RUN_ID:?}" --workflow-run-attempt "${GITHUB_RUN_ATTEMPT:?}")
+xcrun swift Scripts/prepare-release-diagnostics.swift "${diagnostics_args[@]}"
+
 cat > "$release_temp/ExportOptions.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -199,6 +214,8 @@ read_info() { /usr/libexec/PlistBuddy -c "Print :$1" "$info"; }
 [[ "$(read_info SUFeedURL)" == "$feed_url" && "$(read_info SURequireSignedFeed)" == true ]] || fail 'archive requires the official signed update feed'
 [[ "$(read_info SUSignedFeedFailureExpirationInterval)" == 0 && "$(read_info SUVerifyUpdateBeforeExtraction)" == true ]] || fail 'archive must reject unsigned feeds and verify updates before extraction'
 [[ "$(lipo -archs "$app/Contents/MacOS/ZashDock")" == arm64 ]] || fail 'App executable must contain only arm64'
+exported_uuid=$(xcrun dwarfdump --uuid "$app/Contents/MacOS/ZashDock" | awk '{print $2}')
+[[ "$exported_uuid" == "$(jq -r .application.executable_uuid "$diagnostics_metadata")" ]] || fail 'retained symbols do not match the exported App UUID'
 xcrun swift "$release_temp/validate-key.swift" "$release_temp/sparkle-private.key" "$info"
 codesign --verify --deep --strict --verbose=2 "$app"
 codesign -d --verbose=4 "$app" > "$release_temp/codesign.txt" 2>&1
@@ -245,7 +262,8 @@ assert_unused_release
 gh release create "$tag" --repo "$repository" --target "$source_commit" \
   --title "ZashDock $RELEASE_VERSION" --draft \
   --notes-file "$release_temp/updates/${asset_name%.zip}.md" \
-  "$release_temp/updates/$asset_name" "$release_temp/updates/appcast.xml" "$release_temp/updates/SHA256SUMS.txt"
+  "$release_temp/updates/$asset_name" "$release_temp/updates/appcast.xml" "$release_temp/updates/SHA256SUMS.txt" \
+  "$diagnostics_zip" "$diagnostics_metadata" "$diagnostics_checksums"
 assert_current_main
 gh release edit "$tag" --repo "$repository" --draft=false --latest
 release_published=true

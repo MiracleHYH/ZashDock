@@ -12,7 +12,7 @@ struct LocalNavigationPolicy: WebPage.NavigationDeciding {
             return action.target?.isMainFrame == false ? .cancel : .allow
         }
         if url.scheme == "blob", url.absoluteString.hasPrefix("blob:\(origin.absoluteString)/"), action.source.isMainFrame, action.shouldPerformDownload {
-            return .download
+            return .cancel // Blob exports are handled by the bounded native save bridge.
         }
         if ["https", "http"].contains(url.scheme?.lowercased() ?? ""), action.source.isMainFrame {
             NSWorkspace.shared.open(url)
@@ -36,18 +36,50 @@ enum WebCacheController {
 final class WebSession {
     let page: WebPage
     let origin: URL
-    let storageBridge: ZashboardStorageBridge?
+    let interactions: WebInteractionCoordinator
+    private(set) var runtimeFailure: String?
+    var hasRuntimeFailure: Bool { runtimeFailure != nil }
+    @ObservationIgnored var onFailure: (@MainActor (String) -> Void)?
+    @ObservationIgnored private var navigationTask: Task<Void, Never>?
+    @ObservationIgnored private var validationTask: Task<Void, Never>?
+    @ObservationIgnored private var suspensionTask: Task<Void, Never>?
+    private var verifiedInitialDocument = false
+    private var stopped = false
+    private var navigationGeneration = 0
+    private var validatingNavigation = false
     private let expectedVersion: String?
     private let expectedNonce: String?
-    init(origin: URL, storageBridge: ZashboardStorageBridge? = nil, expectedVersion: String? = nil, expectedNonce: String? = nil) {
-        self.origin = origin; self.storageBridge = storageBridge
+    init(origin: URL, expectedVersion: String? = nil, expectedNonce: String? = nil, dataStore: WKWebsiteDataStore = .default(), panels: any WebPanelDriving = NativeWebPanelDriver()) {
+        self.origin = origin
         self.expectedVersion = expectedVersion; self.expectedNonce = expectedNonce
         var configuration = WebPage.Configuration()
-        configuration.websiteDataStore = .default()
-        if let storageBridge { configuration.userContentController = storageBridge.controller }
+        configuration.websiteDataStore = dataStore
+        let controller = WKUserContentController()
+        configuration.userContentController = controller
+        interactions = WebInteractionCoordinator(origin: origin, controller: controller, panels: panels)
         configuration.defaultNavigationPreferences.preferredHTTPSNavigationPolicy = .keepAsRequested
         configuration.deviceSensorAuthorization = .init(decision: .deny)
-        page = WebPage(configuration: configuration, navigationDecider: LocalNavigationPolicy(origin: origin))
+        page = WebPage(configuration: configuration, navigationDecider: LocalNavigationPolicy(origin: origin), dialogPresenter: interactions)
+        let page = page
+        navigationTask = Task { @MainActor [weak self] in
+            // A policy cancellation terminates an individual sequence; keep observing
+            // the next navigation rather than losing all later failure notifications.
+            while !Task.isCancelled {
+                let events = page.navigations
+                do {
+                    for try await event in events {
+                        guard !Task.isCancelled else { return }
+                        self?.observe(event)
+                    }
+                    return
+                } catch {
+                    guard !Task.isCancelled, let self, !self.stopped else { return }
+                    self.reportNavigationFailure(error)
+                    if !Self.ignoresNavigationError(error) { return }
+                    if self.validatingNavigation { self.validateNavigationDocument() }
+                }
+            }
+        }
     }
     func loadAndVerify() async throws {
         var request = URLRequest(url: origin)
@@ -59,6 +91,10 @@ final class WebSession {
         }
         defer { timeout.cancel() }
         for try await _ in page.load(request) { try Task.checkCancellation() }
+        try await verifyDocument()
+        verifiedInitialDocument = true
+    }
+    private func verifyDocument() async throws {
         let valid = try await page.callJavaScript("""
             if (location.origin !== expected) return false;
             const deadline = Date.now() + 8000;
@@ -75,16 +111,73 @@ final class WebSession {
             return false;
             """, arguments: ["expected": "http://127.0.0.1:\(origin.port!)", "version": expectedVersion ?? "", "nonce": expectedNonce ?? ""])
         guard valid as? Bool == true else { throw ZashDockError.verification("Zashboard 未正常渲染，或本地服务版本验证失败。") }
-        try await storageBridge?.verifyRestore(page)
     }
-    func flush() async throws { if let storageBridge { try await storageBridge.flush(page) } }
+    private func observe(_ event: WebPage.NavigationEvent) {
+        guard verifiedInitialDocument, !stopped, !hasRuntimeFailure else { return }
+        if event == .startedProvisionalNavigation {
+            navigationGeneration += 1
+            validationTask?.cancel()
+            validatingNavigation = true
+        } else if event == .finished {
+            validateNavigationDocument()
+        }
+    }
+    private func validateNavigationDocument() {
+        let generation = navigationGeneration
+        validationTask?.cancel()
+        validationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.verifyDocument()
+                guard !Task.isCancelled, generation == self.navigationGeneration, !self.stopped else { return }
+                self.validatingNavigation = false
+            } catch {
+                guard !Task.isCancelled, generation == self.navigationGeneration else { return }
+                self.reportNavigationFailure(error)
+            }
+        }
+    }
+    private func reportNavigationFailure(_ error: any Error) {
+        guard verifiedInitialDocument, !stopped, !hasRuntimeFailure else { return }
+        if Self.ignoresNavigationError(error) { return }
+        let message: String
+        if case WebPage.NavigationError.webContentProcessTerminated = error {
+            message = "网页进程已结束。已保存的数据仍在，请重新载入 Zashboard。"
+        } else {
+            message = "网页无法继续显示。已保存的数据仍在，请重新载入 Zashboard。"
+        }
+        runtimeFailure = message
+        interactions.stop()
+        onFailure?(message)
+    }
+    static func ignoresNavigationError(_ error: any Error) -> Bool {
+        let underlying: any Error
+        if case let WebPage.NavigationError.failedProvisionalNavigation(reason) = error { underlying = reason }
+        else { underlying = error }
+        let cocoa = underlying as NSError
+        // A cancelled navigation or one handed to the system browser does not invalidate the local page.
+        return (cocoa.domain == NSURLErrorDomain && cocoa.code == NSURLErrorCancelled)
+            || (cocoa.domain == "WebKitErrorDomain" && cocoa.code == 102)
+    }
     func suspend() async {
-        storageBridge?.disableAutomaticPersistence()
+        if let suspensionTask { await suspensionTask.value; return }
+        stopped = true
+        navigationTask?.cancel(); validationTask?.cancel()
+        interactions.stop()
         // Unload the old JavaScript context and its sockets before reusing the same Origin for another version.
-        storageBridge?.controller.removeAllUserScripts()
-        do {
-            for try await _ in page.load(simulatedRequest: URLRequest(url: origin.appendingPathComponent("__zashdock_suspended")), responseHTML: "<html><body></body></html>") {}
-        } catch { page.stopLoading() }
+        // Cleanup must finish even when the operation that requested it has been cancelled.
+        let page = page, url = origin.appendingPathComponent("__zashdock_suspended")
+        let unloading = Task { @MainActor in
+            do {
+                for try await _ in page.load(simulatedRequest: URLRequest(url: url), responseHTML: "<html><head><meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; base-uri 'none'; form-action 'none'\"></head><body></body></html>") {}
+            } catch { page.stopLoading() }
+        }
+        suspensionTask = unloading
+        await unloading.value
     }
-    func stop() { storageBridge?.disableAutomaticPersistence(); page.stopLoading() }
+    func stop() {
+        stopped = true
+        navigationTask?.cancel(); validationTask?.cancel()
+        interactions.stop(); page.stopLoading()
+    }
 }

@@ -36,11 +36,11 @@ ZIP 结构正确、文件名叫 `dist.zip`、页面标题相同，都不能证�
 
 [`Backend` 类型](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/types/index.d.ts#L6)包括 `type`、`protocol`、`host`、`port`、`secondaryPath`、`password`、`uuid`，以及可选标签和控制开关。`password` 包含敏感凭据；不得将存储内容、凭据或完整请求 URL 写入日志。本文不包含任何实际 Remote 或凭据。
 
-官方 [`useStorage` 包装](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/composables/use-storage.ts#L5)采用 VueUse，配置 `writeDefaults: false`。网页初始化时会立即读取存储并执行旧数据迁移。ZashDock 必须在官方应用脚本执行之前恢复完整键值快照，不能在网页完成加载后再恢复。
+官方 [`useStorage` 包装](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/composables/use-storage.ts#L5)采用 VueUse，配置 `writeDefaults: false`。网页初始化时会立即读取存储并执行旧数据迁移。切换端口时必须在官方应用脚本执行之前完成存储恢复，不能在网页完成加载后再恢复。
 
-官方[设置导出](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/helper/utils.ts#L41)仅处理 `config/`，不包含 `setup/`，因此不能将其当作 Remote 备份接口。原生快照应保留所有 LocalStorage 键和原始字符串值，不推测或重写上游数据结构；快照需加密，密钥存入 Keychain。
+官方[设置导出](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/helper/utils.ts#L41)仅处理 `config/`，不包含 `setup/`，因此不能将其当作 Remote 备份接口。文件导入同样只合并 `config/` 后 reload。端口转移应保留所有 LocalStorage 键和原始字符串值，不推测或重写上游数据结构。
 
-端口属于 Origin 的组成部分。跨端口恢复不能依赖旧端口仍能绑定，也不能依赖从旧网页临时读取配置；应用运行期间持续保存的独立快照是启动时旧端口被占用情形的恢复依据。
+端口属于 Origin 的组成部分。当前生产实现以默认持久 WebKit DataStore 保存日常数据；只在修改端口时，通过可信 `WebPage.load(simulatedRequest:responseHTML:)` 空文档读旧 Origin、恢复并核验新 Origin，然后加载官方网页、提交端口。旧端口被其他程序占用时不需要向它发出连接。原生不再常驻同步 Remote 或保存新加密快照；旧密文仅用于一次性只读兼容。实现和回归边界见 [STORAGE-DESIGN.md](STORAGE-DESIGN.md)。
 
 ## IndexedDB 限制
 
@@ -49,7 +49,9 @@ LocalStorage 并非上游全部网页数据。官方还使用 IndexedDB：
 - [`base64`](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/helper/indexeddb.ts#L102) 保存本地上传背景图，键为 `background-image`。
 - [`connection-history`](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/helper/indexeddb.ts#L214) 保存按 Remote UUID 和聚合类型区分的连接历史。
 
-仅迁移 LocalStorage 可以覆盖 Remote 及存于 LocalStorage 的设置，**不能宣称已迁移完整 Origin 数据**。背景图的设置值可能成功迁移，而其 IndexedDB 图像数据仍留在旧 Origin。若实现未迁移 IndexedDB，须在测试与用户说明中明确这一限制；缓存处理也不能删除这些数据库。
+这两个数据库在 v3.29.1 均为 version 1，同名 objectStore、keyPath 为 `key`，没有 autoIncrement 或索引，记录为 `{key,value:string}`。背景图是 DataURL 字符串，历史是 JSON 字符串；官方设置导出均不包含。当前 `OriginStorageTransfer` 按这两种实际业务结构读取和恢复，并等待数据库事务完成；不实现任意 IndexedDB 迁移框架。
+
+当前端口转移保留完整 LocalStorage、背景 DataURL 和连接历史，不能宣称已迁移全部 Origin 数据。Cookie、凭据、sessionStorage、通用 Blob/索引或未知数据库不在承诺范围。发现未知数据库、版本、schema、记录类型或超限输入时，提交前停止并保留源数据，不跳过未知内容后清理源。清理只清空已支持业务 objectStore 的记录，保留空 schema。
 
 ## PWA、缓存与版本切换
 
@@ -60,9 +62,11 @@ LocalStorage 并非上游全部网页数据。官方还使用 IndexedDB：
 - `cleanupOutdatedCaches()`；
 - 以 `index.html` 为响应的导航路由。
 
-因此静态服务器设置 `Cache-Control: no-store` 仍不能单独保证网页显示当前安装版本。更新和回滚需要处理当前 Origin 的 Service Worker 注册、CacheStorage 以及 HTTP 资源缓存，并等待操作完成后重新创建或加载页面；只调用 `unregister()` 而继续使用原有受控页面，也不足以证明控制器已经退出。验证应确认页面实际加载当前版本资源，包含回滚至旧版和重启后加载场景。
+因此静态服务器设置 `Cache-Control: no-store` 仍不能单独保证网页显示当前安装版本。当前实现卸载旧 JavaScript 上下文，按明确类型清理应用 DataStore 中 loopback 记录的 Service Worker 注册、Fetch Cache、磁盘/内存缓存，并拒绝新的 Service Worker 脚本请求。新页面必须通过实际渲染和服务版本/nonce 验证；只调用 `unregister()` 或只等 HTTP 完成不构成版本验收。
 
-清理范围必须限于受管面板的缓存数据类型。不能调用全类型 WebsiteDataStore 清理，不能删除 LocalStorage、IndexedDB、Remote 快照或 Keychain 密钥。Apple 提供独立的 [Service Worker 注册数据类型](https://developer.apple.com/documentation/webkit/wkwebsitedatatypeserviceworkerregistrations)和 [Fetch Cache 数据类型](https://developer.apple.com/documentation/webkit/wkwebsitedatatypefetchcache)，可作为选择性处理的依据。
+清理不调用全类型 WebsiteDataStore 删除，不包含 LocalStorage、IndexedDB、Cookie 或凭据。WebKit 站点记录粒度不等于精确单端口，不能宣称只清理一个端口缓存。Apple 提供独立的 [Service Worker 注册数据类型](https://developer.apple.com/documentation/webkit/wkwebsitedatatypeserviceworkerregistrations)和 [Fetch Cache 数据类型](https://developer.apple.com/documentation/webkit/wkwebsitedatatypefetchcache)，用于选择性处理。
+
+资源版本与用户数据没有一一对应的快照。更新和回滚先将已支持业务数据复制到 `.nonPersistent()` DataStore，验证候选网页，再提交当前资源指针；持久 live 页面验证成功才清理历史。指针提交后 live 失败保留新指针和旧资源，提示重载，不能承诺回退资源即可撤销上游已执行的数据迁移。
 
 ## HTTP、WebSocket 和 CORS
 
@@ -76,7 +80,9 @@ LAN/VPN 连通性还取决于用户网络路由、Surge 运行模式、服务绑
 
 ## 原生更新与网页内核更新的区别
 
-官方 [`upgradeUIAPI`](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/api/clash.ts#L236)调用所选远程 Mihomo 的 `POST /upgrade/ui`；网页[自动更新逻辑](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/assembly/version.ts#L147)也可能触发它。该接口不管理 ZashDock 的本地发行目录。ZashboardUpdateManager 必须直接使用官方 GitHub Releases 及本地原子版本切换，不能借用 Mihomo `/upgrade/ui`。若产品禁止网页触发该路径，限制必须覆盖真实网络请求，并清楚提示原生更新入口，不能返回伪造的成功结果。
+官方 [`upgradeUIAPI`](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/api/clash.ts#L236)调用所选远程 Mihomo 的 `POST /upgrade/ui`；网页[自动更新逻辑](https://github.com/Zephyruso/zashboard/blob/v3.29.1/src/assembly/version.ts#L147)也可能触发它。该接口不管理 ZashDock 的本地发行目录。`ZashboardUpdateManager` 直接使用官方 GitHub Releases 和本地版本事务，不调用 Mihomo `/upgrade/ui`，也不把该接口的成功误报成本地升级。官方网页资源保持原样，不能把原生导航策略描述成拦截全部远程子资源请求。
+
+ZashDock Wrapper 自身的 Sparkle 更新来自 [MiracleHYH/ZashDock](https://github.com/MiracleHYH/ZashDock)，与 Zashboard 网页更新分开；仓库配置与签名流程见 [RELEASING.md](RELEASING.md)。本轮开发不创建 Release。
 
 ## 研究方法与实际执行记录
 

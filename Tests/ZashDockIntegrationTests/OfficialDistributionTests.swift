@@ -1,17 +1,9 @@
 import AppKit
-import CryptoKit
 import Foundation
 import Testing
 import WebKit
 @testable import ZashDock
 import ZashDockCore
-
-private struct OfficialDistributionKey: StorageSnapshotKeyProviding {
-    func encryptionKey(createIfMissing: Bool) throws -> SymmetricKey {
-        // Deliberately fixed, test-only key. This never reads or replaces the production Keychain key.
-        SymmetricKey(data: Data(repeating: 0x6c, count: 32))
-    }
-}
 
 @Suite(.serialized)
 @MainActor
@@ -39,10 +31,10 @@ struct OfficialDistributionTests {
             configuration.port = reservation.port
             try ConfigurationStore(url: fixture.paths.configuration).save(configuration)
             // Clear only this reserved test Origin without loading any old webpage or seeding the
-            // native vault. The first real install must still exercise snapshot == nil durability.
+            // persistent profile before exercising the first real installation.
             do {
                 var webConfiguration = WebPage.Configuration()
-                webConfiguration.websiteDataStore = .default()
+                webConfiguration.websiteDataStore = fixture.dataStore
                 let emptyOrigin = WebPage(configuration: webConfiguration)
                 for try await _ in emptyOrigin.load(simulatedRequest: URLRequest(url: reservation.baseURL), responseHTML: "<html><body></body></html>") {}
                 try await emptyOrigin.callJavaScript("localStorage.clear();")
@@ -57,7 +49,7 @@ struct OfficialDistributionTests {
             #expect(model.session == nil)
             #expect(model.server == nil)
             #expect(model.errorMessage == nil)
-            #expect(!FileManager.default.fileExists(atPath: fixture.paths.snapshot.path))
+            #expect(!FileManager.default.fileExists(atPath: fixture.paths.root.appendingPathComponent("storage.aesgcm").path))
 
             // There is deliberately no await between the button's install action and cancel. The
             // child Task cannot run on this MainActor until after its cancellation is requested.
@@ -77,7 +69,7 @@ struct OfficialDistributionTests {
             #expect(try await store.history().isEmpty)
             #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.versions.path).isEmpty)
             #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.staging.path).isEmpty)
-            #expect(!FileManager.default.fileExists(atPath: fixture.paths.snapshot.path))
+            #expect(!FileManager.default.fileExists(atPath: fixture.paths.root.appendingPathComponent("storage.aesgcm").path))
 
             // Retry through the same AppModel entry point used by the native import button. This
             // authenticates and extracts the real ZIP, loads official JavaScript, then commits it.
@@ -92,24 +84,24 @@ struct OfficialDistributionTests {
             #expect(model.operation == nil)
             #expect(!model.isBusy)
             #expect(model.errorMessage == nil)
-            #expect(FileManager.default.fileExists(atPath: fixture.paths.snapshot.path))
+            #expect(!FileManager.default.fileExists(atPath: fixture.paths.root.appendingPathComponent("storage.aesgcm").path))
             let session = try #require(model.session)
             let result = try await session.page.callJavaScript("""
                 const app = document.getElementById('app');
                 const encoded = localStorage.getItem('setup/api-list');
                 const remotes = encoded ? JSON.parse(encoded) : [];
-                const initial = window.__zashdockStorageSnapshot.initialAcknowledgement.snapshot;
+                const noNativeBridge = typeof window.__zashdockStorageSnapshot === "undefined";
                 return {
                     rendered: !!app && app.childElementCount > 0,
                     remoteCount: remotes.length,
-                    initialKeyCount: Object.keys(initial).length,
+                    noNativeBridge,
                     noActiveRemote: !localStorage.getItem('setup/active-uuid')
                 };
                 """)
             let state = try #require(result as? [String: Any])
             #expect(state["rendered"] as? Bool == true)
             #expect((state["remoteCount"] as? NSNumber)?.intValue == 0)
-            #expect((state["initialKeyCount"] as? NSNumber)?.intValue == 0)
+            #expect(state["noNativeBridge"] as? Bool == true)
             #expect(state["noActiveRemote"] as? Bool == true)
             await fixture.shutdown(model)
             await fixture.cleanUp()
@@ -152,17 +144,16 @@ struct OfficialDistributionTests {
             fixture.mihomoServers.append(secondMihomo)
             #expect(firstMihomo.port != secondMihomo.port)
             let expected = try expectedStorage(firstPort: firstMihomo.port, secondPort: secondMihomo.port)
-            let vault = StorageSnapshotVault(url: fixture.paths.snapshot, keyProvider: OfficialDistributionKey())
-            try await vault.save(expected)
+            let transfer = OriginStorageTransfer(dataStore: fixture.dataStore)
+            try await transfer.restore(OriginStoragePayload(localStorage: expected), to: reservation.baseURL)
             reservation.stop()
 
             let original = fixture.model()
             await original.start()
             try await assertOfficialState(original, expected: expected)
             #expect(original.configuration.port == configuration.port)
-            try await original.session?.flush()
-            let encrypted = try Data(contentsOf: fixture.paths.snapshot)
-            #expect(encrypted.range(of: Data(MockMihomoServer.fixtureToken.utf8)) == nil)
+            try assertStorage(try await transfer.read(origin: reservation.baseURL).localStorage, expected: expected)
+            #expect(!FileManager.default.fileExists(atPath: fixture.paths.root.appendingPathComponent("storage.aesgcm").path))
 
             await fixture.shutdown(original)
             let restarted = fixture.model()
@@ -181,10 +172,10 @@ struct OfficialDistributionTests {
             #expect(restarted.configuration.port == newPort)
             #expect(restarted.session?.origin.port == Int(newPort))
             #expect(try ConfigurationStore(url: fixture.paths.configuration).load().port == newPort)
-            let migratedSnapshot = try #require(try await vault.load().snapshot)
+            let migratedSnapshot = try await transfer.read(origin: URL(string: "http://127.0.0.1:\(newPort)")!).localStorage
             try assertStorage(migratedSnapshot, expected: expected)
 
-            // A second restart proves both the port commit and the independent encrypted snapshot survive.
+            // A second restart proves both the port commit and the persistent WebKit profile survive.
             await fixture.shutdown(restarted)
             let restartedAtNewPort = fixture.model()
             await restartedAtNewPort.start()
@@ -234,7 +225,7 @@ struct OfficialDistributionTests {
     private struct PageState: Decodable {
         let origin: String
         let renderedChildren: Int
-        let initialSnapshot: [String: String]
+        let hasNativeBridge: Bool
         let currentSnapshot: [String: String]
         let health: [String: String]
     }
@@ -245,18 +236,15 @@ struct OfficialDistributionTests {
         #expect(model.currentVersion?.sha256 == ZashboardRelease.offlineSeed.sha256)
         #expect(model.errorMessage == nil)
         let session = try #require(model.session)
-        let bridge = try #require(session.storageBridge)
-        // verifyRestore checks the immutable acknowledgement captured before official module initialization.
-        try await bridge.verifyRestore(session.page)
         let value = try await session.page.callJavaScript("""
             const app = document.getElementById('app');
-            const acknowledgement = window.__zashdockStorageSnapshot.initialAcknowledgement;
+            const hasNativeBridge = typeof window.__zashdockStorageSnapshot !== "undefined";
             const response = await fetch('/__zashdock_health', {cache: 'no-store'});
             if (!response.ok) throw new Error('official fixture health check failed');
             return JSON.stringify({
                 origin: location.origin,
                 renderedChildren: app ? app.childElementCount : 0,
-                initialSnapshot: acknowledgement.snapshot,
+                hasNativeBridge,
                 currentSnapshot: Object.fromEntries(Object.keys(localStorage).map(key => [key, localStorage.getItem(key)])),
                 health: await response.json()
             });
@@ -267,7 +255,7 @@ struct OfficialDistributionTests {
         #expect(state.origin == session.origin.absoluteString)
         #expect(state.health["version"] == model.currentVersion?.id)
         #expect(state.health["nonce"] == model.server?.nonce)
-        try assertStorage(state.initialSnapshot, expected: expected)
+        #expect(!state.hasNativeBridge)
         try assertStorage(state.currentSnapshot, expected: expected)
     }
 
@@ -287,12 +275,13 @@ struct OfficialDistributionTests {
 @MainActor
 private final class OfficialDistributionFixture {
     let paths: AppPaths
+    let dataStore = WKWebsiteDataStore(forIdentifier: UUID())
     var reservations: [LoopbackHTTPServer] = []
     var mihomoServers: [MockMihomoServer] = []
     private var models: [AppModel] = []
     init(paths: AppPaths) { self.paths = paths }
     func model() -> AppModel {
-        let model = AppModel(paths: paths, keyProvider: OfficialDistributionKey())
+        let model = AppModel(paths: paths, dataStore: dataStore)
         models.append(model); return model
     }
     func shutdown(_ model: AppModel) async {
@@ -306,6 +295,7 @@ private final class OfficialDistributionFixture {
         for reservation in reservations { reservation.stop() }
         for mihomo in mihomoServers { mihomo.stop() }
         reservations.removeAll(); mihomoServers.removeAll()
+        await dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
         try? FileManager.default.removeItem(at: paths.root)
     }
 }

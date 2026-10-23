@@ -23,10 +23,17 @@ public final class ZashboardUpdateManager {
         isBusy = true; lastError = nil; status = "正在检查官方稳定版…"
         defer { isBusy = false }
         do {
+            try Task.checkCancellation()
             latest = try await client.latest()
             releases = try await client.stableReleases()
             status = "版本目录已更新。"
-        } catch { lastError = error.localizedDescription; status = "检查失败，可重试或导入官方 ZIP。"; throw error }
+        } catch {
+            if error is CancellationError || Task.isCancelled {
+                lastError = nil; status = "已取消检查更新。"
+                throw CancellationError()
+            }
+            lastError = error.localizedDescription; status = "检查失败，可重试或导入官方 ZIP。"; throw error
+        }
     }
 
     public func stageLatest() async throws -> InstalledVersion {

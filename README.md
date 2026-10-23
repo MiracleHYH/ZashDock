@@ -4,7 +4,9 @@ ZashDock 是仅面向 Apple Silicon 的 macOS 原生 Zashboard 容器：从 [Zep
 
 应用采用 SwiftUI、macOS 26 的 WebKit `WebView` / `WebPage`、Swift Concurrency 和 Observation。Swift Package Manager 管理本地 Core 包和 Sparkle，系统 zlib 用于解压。没有 Electron、Tauri、Node.js、Docker 或内置 Mihomo Kernel，也不修改 Surge 或系统代理设置。App Bundle 不包含 Zashboard `dist` 静态资源。
 
-原生安装、版本管理、静态服务、加密存储桥接、端口事务、更新及回滚界面均已实现。已执行真实 `xcodebuild` 和 Swift Testing；逐项结果及实际限制见 [测试说明](Docs/TESTING.md)。
+原生安装、版本管理、静态服务、WebKit 持久化、端口事务、更新及回滚界面均已实现。已执行真实 `xcodebuild` 和 Swift Testing；逐项结果及实际限制见 [测试说明](Docs/TESTING.md)。
+
+2026-10-23 审计修复已通过 P1、P2 阶段编译与回归，详情见 [修复记录](Docs/REMEDIATION.md)。现已采用“WebKit 日常持久化＋改端口时一次性转移完整业务数据”，移除了持续同步的原生配置副本和相关恢复界面；未发布 Release。
 
 ## 构建与运行
 
@@ -35,6 +37,8 @@ Scripts/swift-build.sh       # 编译原生应用和本地 Core 包
 Scripts/build-debug.sh       # 生成 build/Debug/ZashDock.app 并进行本机签名
 Scripts/test-core.sh         # Core 单元测试
 Scripts/test-integration.sh  # WebKit 集成测试
+Scripts/test-storage-processes.sh # 隔离 WebKit profile 的真实跨进程持久化与强退测试
+Scripts/test-appmodel-processes.sh # 正式 AppModel 端口提交后强退与冷启动
 ```
 
 WebKit、沙盒和 App 生命周期的验收应使用 Xcode 的实际 App 测试宿主。运行工程测试：
@@ -68,7 +72,7 @@ SHA-256：4f16cce229e223bd07b5a3daccfbfb8bf349d7335572d412959284ab6c9bab50
 
 本地服务默认端口为 **9099**。在原生 **设置 → 通用** 中可以指定 **1024–65535**，或主动点击“自动选择并保存可用端口”。自动选择只在用户显式触发后进行，当前探测范围为 9099–9198；应用不会在启动失败时静默修改端口。
 
-端口切换执行“保存最新快照 → 实际绑定候选端口 → 在网页初始化前恢复存储 → 验证页面和恢复结果 → 原子保存端口配置”。提交前保留旧监听器；失败时仍使用原配置和快照。即使启动前原端口已被其他程序占用，也能从独立原生快照迁移到新端口。
+端口切换执行“暂停网页并停止旧服务 → 一次性读取当前 WebKit 数据到内存 → 实际绑定新端口 → 在网页初始化前写入并核验数据 → 验证真实网页 → 原子保存端口 → 清理旧 Origin”。始终只运行一个 HTTP 监听器；提交前失败会保留原端口和原数据，并尝试重新启动旧服务。旧端口在启动前已被占用时，仍可通过可信模拟文档直接读取该 Origin 的 WebKit 存储，不会请求占用端口的程序。
 
 远程 Mihomo 需要允许实际面板 Origin。使用精确白名单时，可按远端版本配置：
 
@@ -81,23 +85,21 @@ external-controller-cors:
 
 修改本地端口后，须相应检查远端白名单。具体配置见 [Mihomo 官方文档](https://github.com/MetaCubeX/Meta-Docs/blob/main/docs/config/general.en.md#external-control-api)。应用不会替用户修改远端、Surge 或系统代理配置；LAN/VPN 连通性还取决于实际路由、权限和防火墙。HTTP Remote 支持明文连接，凭据保护需要后端提供 HTTPS；浏览器 CORS 仍然生效。
 
-## 存储与恢复
+## 网页数据持久化
 
-`ZashboardStorageBridge` 持续同步完整 LocalStorage 字符串键值，包括多个 Remote 的 `setup/api-list` 和当前选择的 `setup/active-uuid`。修改端口、切换页面和退出前会主动读取最新数据。恢复脚本在官方网页脚本执行前同步写入存储，并核验初始恢复结果。
+日常配置只保存在固定的持久 `WKWebsiteDataStore.default()` 中，由原版 Zashboard 正常读写 LocalStorage 和 IndexedDB。普通重载、退出和重启不导出配置、不重新注入旧值，也不增加原生 Remote 文件、定时同步或 Keychain 密钥。用户主动清空网页设置后，应用不会回放旧配置。
 
-独立原生快照和上一次有效备份采用 **AES-256-GCM** 加密，密钥保存在系统 **Keychain**。密钥不可用或密文损坏时不降级写入明文，也不把失败解释为“空配置”；有效备份恢复会明确提示。网页 LocalStorage 本身仍使用 WebKit 的持久化存储，快照加密不代表整个 WebsiteDataStore 被应用另行加密。
+改端口时，`OriginStorageTransfer` 一次性转移完整 LocalStorage，以及已核验的官方 `base64`、`connection-history` 两个 IndexedDB，包含 Remote、选中后端、设置、本地背景图和连接历史。数据只暂存在内存；目标数据在官方网页初始化前已写入。未知数据库或结构、超限、取消和验证失败都会中止提交并保留源数据。这里的“完整”指当前官方版本的业务数据，不包含 Cookie、sessionStorage、Service Worker 和可重新生成的缓存。
 
-当前跨端口迁移的范围是 **LocalStorage**。官方自定义本地背景图和连接历史保存在 IndexedDB，**尚不跨端口迁移**；这不是完整 Origin 数据迁移。原 Origin 中的 IndexedDB 数据不会被版本清理删除。测试代码覆盖两个 Remote、文档开始恢复、写入捕获、重新创建 Vault、损坏备份恢复、错误密钥和桥接来源限制；通过情况见 [测试说明](Docs/TESTING.md)。
+原生设置文件只记录端口、历史版本数量、窗口行为及清理标记。端口提交成功后才清理旧 Origin；若中断，重启会根据已提交端口继续工作并重试旧数据清理。普通设置损坏时先保全原文件，再显式恢复原端口，避免误把其他 Origin 当成空配置。
 
-Bundle ID 固定为 `app.zashdock.mac`，Keychain 使用稳定的 service/account。不要为了重置调试界面随意更改这些身份或删除 Keychain 项，否则已有加密快照可能无法解密。
-
-ad hoc Debug 构建重签名后代码身份会变化，系统可能要求重新确认钥匙串访问。持续开发和发布建议使用稳定的开发或发布证书；不要放宽钥匙串 ACL 或删除生产密钥来规避提示。自动测试使用独立的测试钥匙串条目，并只清理自己创建的测试条目。
+从早期开发版升级时，`LegacyWebStorageReader` 可只读认证原密文并完成一次导入。成功标记后不再读取旧密文或访问其 Keychain 项；原文件不会被修改或删除。旧密钥暂不可读时保留文件并允许重试，不生成替代密钥。全新安装不使用此兼容路径。Bundle ID 固定为 `app.zashdock.mac`，请保持应用身份稳定。
 
 ## 更新与回滚契约
 
-在原生 **设置 → 更新** 中检查稳定版、安装最新或历史稳定版、导入官方 ZIP、查看本地历史并手动回滚。`ZashboardUpdateManager` 独立处理官方来源和下载；实际网页渲染、存储恢复及本地服务版本验证成功后才提交版本指针。已执行更新、回滚、无效候选和取消恢复的实际 WebKit 测试。
+在原生 **设置 → 更新** 中检查稳定版、安装最新或历史稳定版、导入官方 ZIP、查看本地历史并手动回滚。`ZashboardUpdateManager` 独立处理官方来源和下载；候选先使用临时 WebKit 存储验证实际网页及本地服务版本，通过后才提交版本指针，再加载日常持久 profile。候选失败或取消不会清空当前配置。若提交后的持久页面加载失败，保留已提交版本与历史资源，显示重新载入入口；只有持久页面成功加载后才执行历史清理。
 
-保留参数 `maxRollbackVersions = N` 默认 **1**，允许 **0**；N 仅计算历史版本，不包含当前版本。成功操作完成后的版本数量上限为 **N + 1**。首次安装只有当前版本，失败或未激活候选不属于历史。历史按最近激活顺序保留；回滚目标成为当前版本，原当前版本进入历史，同样应用上限。清理只在候选验证与提交成功后执行，不删除正在使用的版本或用户快照。
+保留参数 `maxRollbackVersions = N` 默认 **1**，允许 **0**；N 仅计算历史版本，不包含当前版本。成功操作完成后的版本数量上限为 **N + 1**。首次安装只有当前版本，失败或未激活候选不属于历史。历史按最近激活顺序保留；回滚目标成为当前版本，原当前版本进入历史，同样应用上限。清理只在候选验证与提交成功后执行，不删除正在使用的版本或网页业务数据。
 
 本地面板更新由原生安装器直接处理官方 Releases，不能通过 Mihomo `/upgrade/ui` 更新 ZashDock 的网页目录。版本切换处理 loopback 的 Service Worker 和可丢弃缓存，不全量清空 WebsiteDataStore，不删除 LocalStorage 或 IndexedDB。
 

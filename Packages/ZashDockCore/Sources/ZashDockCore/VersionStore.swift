@@ -13,17 +13,37 @@ public struct InstalledVersion: Codable, Sendable, Identifiable, Equatable {
     }
 }
 
+/// The durable selection made before cleanup starts. Planned removals can remain on disk
+/// after an interrupted/failed cleanup; the next prune safely retries them.
+/// Only managed version identifiers are recorded, never website data or configuration values.
+public struct VersionPruneReport: Codable, Sendable, Equatable {
+    public let recordedAt: Date
+    public let maxHistory: Int
+    public let invalidHistoryIDs: [String]
+    public let retainedHistoryIDs: [String]
+    public let protectedIDs: [String]
+    public let plannedRemovalIDs: [String]
+}
+
 public actor VersionStore {
     private let paths: AppPaths
     private var stateURL: URL { paths.root.appendingPathComponent("versions-state.json") }
     private let extractor: SafeZIPExtractor
-    private struct State: Codable { var schema = 1; var currentID: String?; var activationOrder: [String] }
+    private struct State: Codable {
+        var schema = 1
+        var currentID: String?
+        var activationOrder: [String]
+        // Optional for backward compatibility with all existing schema-1 state files.
+        var lastPruneReport: VersionPruneReport?
+        // Preserve the most recent corruption record across later healthy startup cleanups.
+        var lastInvalidHistoryReport: VersionPruneReport?
+    }
     private struct Manifest: Codable {
         let schema: Int; let id: String; let release: ZashboardRelease; let installedAt: Date; let files: [FileRecord]
     }
     private struct FileRecord: Codable { let path: String; let size: Int; let sha256: String }
 
-    /// Owns root/versions, root/staging and root/versions-state.json. Storage snapshots are never touched.
+    /// Owns root/versions, root/staging and root/versions-state.json. Website data is never touched.
     public init(root: URL, extractor: SafeZIPExtractor = .init()) throws {
         paths = AppPaths(root: root); self.extractor = extractor
         try paths.createDirectories()
@@ -84,6 +104,9 @@ public actor VersionStore {
         return state.activationOrder.reversed().filter { $0 != state.currentID }.compactMap { try? validatedVersion(id: $0) }
     }
 
+    public func lastPruneReport() throws -> VersionPruneReport? { try readState().lastPruneReport }
+    public func lastInvalidHistoryReport() throws -> VersionPruneReport? { try readState().lastInvalidHistoryReport }
+
     public func validate(_ version: InstalledVersion) throws -> InstalledVersion {
         let actual = try validatedVersion(id: version.id)
         guard actual == version else { throw ZashDockError.invalidInstallation("版本描述不匹配。") }
@@ -118,19 +141,63 @@ public actor VersionStore {
 
     /// Pruning is deliberately separate from activation and is called only after verified commit.
     /// An active server's protected ID is always retained, even if a caller has not yet released it.
-    public func prune(maxHistory: Int, protecting: Set<String> = []) throws {
+    @discardableResult
+    public func prune(maxHistory: Int, protecting: Set<String> = []) throws -> VersionPruneReport? {
         guard (0...100).contains(maxHistory) else { throw ZashDockError.invalidConfiguration("历史版本保留数必须在 0–100 之间。") }
+        guard protecting.allSatisfy(validID) else { throw ZashDockError.invalidConfiguration("受保护的版本标识无效。") }
+        try Task.checkCancellation()
         var state = try readState()
-        guard let currentID = state.currentID else { return }
+        guard let currentID = state.currentID else { return nil }
         _ = try validatedVersion(id: currentID)
         let historical = state.activationOrder.reversed().filter { $0 != currentID }
-        let keep = Set(historical.prefix(maxHistory)).union(protecting).union([currentID])
-        // Persist the pruned activation list first. A crash can leave harmless unreferenced directories.
-        state.activationOrder = state.activationOrder.filter { keep.contains($0) }
-        try AtomicFile.encode(state, to: stateURL)
-        for directory in try FileManager.default.contentsOfDirectory(at: paths.versions, includingPropertiesForKeys: nil) {
-            if !keep.contains(directory.lastPathComponent) { try FileManager.default.removeItem(at: directory) }
+        var healthy: [String] = [], invalid: [String] = []
+        for identifier in historical {
+            try Task.checkCancellation()
+            do { _ = try validatedVersion(id: identifier); healthy.append(identifier) }
+            catch {
+                // A cancelled task or temporary I/O failure is not evidence of corrupt data.
+                // Abort before changing the pointer or deleting any directory in those cases.
+                guard Self.isInvalidInstallation(error) else { throw error }
+                invalid.append(identifier)
+            }
         }
+        // Invalid history never consumes a rollback slot. Explicitly protected directories
+        // remain alive even when invalid or temporarily beyond the retention limit.
+        let keep = Set(healthy.prefix(maxHistory)).union(protecting).union([currentID])
+        let directories = try FileManager.default.contentsOfDirectory(at: paths.versions, includingPropertiesForKeys: nil)
+        let byName = Dictionary(uniqueKeysWithValues: directories.map { ($0.lastPathComponent, $0) })
+        // Delete obsolete activated versions from oldest to newest, then sorted unreferenced
+        // preparations. Selection and the recorded plan do not depend on filesystem ordering.
+        let activatedRemovals = state.activationOrder.filter { !keep.contains($0) && byName[$0] != nil }
+        let activated = Set(state.activationOrder)
+        let orphanRemovals = byName.keys.filter { !keep.contains($0) && !activated.contains($0) }.sorted()
+        let removalIDs = activatedRemovals + orphanRemovals
+        let removals = removalIDs.compactMap { byName[$0] }
+        let report = VersionPruneReport(recordedAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)),
+            maxHistory: maxHistory, invalidHistoryIDs: invalid,
+            retainedHistoryIDs: healthy.filter { keep.contains($0) }, protectedIDs: protecting.sorted(),
+            plannedRemovalIDs: removalIDs)
+        try Task.checkCancellation()
+        // Persist the pruned activation list first. A crash can leave harmless unreferenced directories.
+        // The same atomic write records why invalid versions were excluded before they disappear.
+        state.activationOrder = state.activationOrder.filter { keep.contains($0) }
+        state.lastPruneReport = report
+        if !invalid.isEmpty { state.lastInvalidHistoryReport = report }
+        try AtomicFile.encode(state, to: stateURL)
+        for directory in removals { try FileManager.default.removeItem(at: directory) }
+        return report
+    }
+
+    private static func isInvalidInstallation(_ error: any Error) -> Bool {
+        if error is DecodingError { return true }
+        if let failure = error as? ZashDockError {
+            switch failure {
+            case .invalidInstallation, .verification: return true
+            default: return false
+            }
+        }
+        let failure = error as NSError
+        return failure.domain == NSCocoaErrorDomain && failure.code == NSFileReadNoSuchFileError
     }
 
     private func readState() throws -> State {
@@ -167,16 +234,31 @@ public actor VersionStore {
     }
     private func fileRecords(in content: URL) throws -> [FileRecord] {
         let values = try content.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard values.isDirectory == true, values.isSymbolicLink != true,
-              let enumerator = FileManager.default.enumerator(atPath: content.path) else {
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
             throw ZashDockError.invalidInstallation("安装内容目录无效。")
         }
+        // Foundation may canonicalize an ancestor such as /var -> /private/var in results.
+        // Enumerate the same canonical root used by the containment check.
+        let enumerationRoot = content.resolvingSymlinksInPath().standardizedFileURL
+        var enumerationFailure: (any Error)?
+        guard let enumerator = FileManager.default.enumerator(at: enumerationRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey, .fileSizeKey],
+            errorHandler: { _, error in enumerationFailure = error; return false }) else {
+            throw ZashDockError.storage("无法读取安装内容目录；已有版本未被清理。")
+        }
+        let prefix = enumerationRoot.path.hasSuffix("/") ? enumerationRoot.path : enumerationRoot.path + "/"
         var records: [FileRecord] = []; var total = 0
-        while let path = enumerator.nextObject() as? String {
+        while let item = enumerator.nextObject() {
             try Task.checkCancellation()
-            let url = content.appendingPathComponent(path)
+            if let enumerationFailure { throw enumerationFailure }
+            guard let url = item as? URL else { throw ZashDockError.storage("安装目录枚举未返回有效的受管路径。") }
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey, .fileSizeKey])
             guard values.isSymbolicLink != true, values.isDirectory == true || values.isRegularFile == true else { throw ZashDockError.invalidInstallation("安装含不安全文件。") }
+            // Normalize both sides: URL enumeration returns /private/var while Foundation's
+            // standardized file URLs can expose the same directory as /var.
+            let canonicalPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+            guard canonicalPath.hasPrefix(prefix) else { throw ZashDockError.invalidInstallation("安装路径超出受管内容目录。") }
+            let path = String(canonicalPath.dropFirst(prefix.count))
             guard values.isRegularFile == true else { continue }
             let size = values.fileSize ?? -1
             total += max(0, size)
@@ -184,6 +266,9 @@ public actor VersionStore {
                   records.count < extractor.limits.maxEntries else { throw ZashDockError.invalidInstallation("安装文件超过安全限制。") }
             records.append(FileRecord(path: path, size: size, sha256: try ReleaseClient.digest(of: url)))
         }
+        // atPath enumeration silently skips unreadable subdirectories. Explicitly propagate
+        // enumeration errors so temporary permissions cannot turn into destructive pruning.
+        if let enumerationFailure { throw enumerationFailure }
         return records.sorted { $0.path < $1.path }
     }
 }
