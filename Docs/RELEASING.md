@@ -8,7 +8,11 @@ ZashDock 原生应用的源码、发布包和应用更新均使用 [MiracleHYH/Z
 https://raw.githubusercontent.com/MiracleHYH/ZashDock/main/appcast.xml
 ```
 
-## 首个正式版：v1.0.0
+## v1.0.1 修复发行
+
+2026-11-02 用户已明确批准发布 `v1.0.1`（`1.0.1 (3)`），继续采用已授权的 `adhoc` 模式。发行说明使用 [RELEASE-NOTES-1.0.1.md](RELEASE-NOTES-1.0.1.md)。保持原 Bundle ID、Sparkle 公钥、Feed、沙盒与发布权限；只有产品版本和构建号递增。对应源码 CI 成功后才手动触发发布；公开资产与 Feed 的实际状态以 GitHub 为准。
+
+## 首个正式版：v1.0.0（历史记录）
 
 本项目通过 GitHub Releases 直接分发，不需要上架 App Store。首个正式版准备使用标签 `v1.0.0`，应用的 `CFBundleShortVersionString` 为 `1.0.0`、`CFBundleVersion` 为 `2`，使此前 Build `1` 的试用安装能识别更新。维护者目前没有 Apple Developer Program 会员，因此显式选择 `signing_mode=adhoc`，使用实际 arm64 Release Archive 和 ad hoc 签名。
 

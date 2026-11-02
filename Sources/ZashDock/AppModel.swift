@@ -159,8 +159,10 @@ final class AppModel {
             }
         }
     }
-    /// Candidate code first runs against a disposable WebKit store. A bad or cancelled
-    /// candidate cannot clear the active profile. There is only one HTTP listener throughout.
+    /// Candidate code first runs against an empty disposable WebKit store. Same-Origin
+    /// updates keep the persistent profile in place and do not use the port-transfer codec.
+    /// Before commit, rejected or cancelled previews cannot touch the persistent profile.
+    /// There is only one HTTP listener throughout.
     private func activateVersion(_ version: InstalledVersion) async throws {
         guard let store, let updater else { throw ZashDockError.invalidConfiguration("版本管理尚未就绪。") }
         _ = try await store.validate(version)
@@ -169,14 +171,10 @@ final class AppModel {
         var listener: LoopbackHTTPServer?
         var candidate: WebSession?
         do {
-            let values = try await originStorage.read(origin: origin(configuration.port))
             status = "正在载入 Zashboard…"; phase = .installing
             let service = try LoopbackHTTPServer(root: version.directoryURL, port: configuration.port, versionID: version.id)
             listener = service; _ = try await service.start()
             let validationStore = WKWebsiteDataStore.nonPersistent()
-            let validationTransfer = OriginStorageTransfer(dataStore: validationStore)
-            try await validationTransfer.restore(values, to: service.baseURL)
-            try await validationTransfer.verify(values, at: service.baseURL)
             let validation = WebSession(origin: service.baseURL, expectedVersion: version.id, expectedNonce: service.nonce, dataStore: validationStore)
             candidate = validation
             try await validation.loadAndVerify()

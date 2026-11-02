@@ -1,5 +1,26 @@
 # 实际构建与测试记录
 
+## 同端口更新与 GeoIP 缓存兼容修复（2026-11-02）
+
+运行环境：Apple Silicon arm64、macOS 27.0.1、Xcode 27.2（27B52）、macOS 27.2 SDK；最低部署版本仍为 macOS 26.0，本轮没有增加最低系统版本实机验收。
+
+已核对官方 v3.29.1（`50717b02dac68425cdc5b80cb754bea768ee4fc9`）和 v3.30.0（`bf4f00bb8d905f8a78f627af7cf84457c4db53c4`）源码。两个业务 IndexedDB 的定义没有改变，但 GeoIP 功能另有 `zashboard-geoip` v2 和旧 `zashboard-earth-geoip` v1，包含 ArrayBuffer、复合键及 Blob。旧 `activateVersion` 在同端口更新前调用端口转移器，遇到这些额外库即可稳定复现“网页存储结构不受当前版本支持”。这并不证明用户存储损坏，也不需要读取用户的 Remote 才能复现。
+
+修复将资源预检与跨 Origin 转移解耦：候选只使用空的独立 nonPersistent profile，提交后在原端口加载原持久 profile。不会为了更新而枚举、导出或回放用户数据；上游自己的迁移仍由持久 live 页面执行。
+
+| 验证 | 实际结果 | 证据（`build/verification/`） |
+| --- | --- | --- |
+| 修复前新增回归 | 2 项执行、2 项失败，稳定复现 | `geoip-update-reproduced.xcresult`、`geoip-update-reproduced-summary.json` |
+| 修复后新增回归 | 2 项通过 | `geoip-update-fixed.xcresult`、`geoip-update-fixed-summary.json` |
+| 全量沙箱 App 构建和测试 | 63 项通过、1 项可选个人后端网络测试跳过、0 失败；64 项 / 16 suites | `geoip-update-complete.xcresult`、`geoip-update-complete-summary.json`、`geoip-update-complete.log` |
+| 最终 Debug 构建与产物清理 | 实际 arm64 构建、签名校验通过；测试宿主和两个开发副本均验证归档后清理，`build` 内不再保留可运行的本项目 App | `geoip-update-debug-build.log`、`build/DevelopmentAppArchives/batch.Ewb0tVPL/` |
+
+新增测试使用随机临时路径和独立持久 WebKit profile，比较两个 Remote、全部 LocalStorage、两个业务库、GeoIP 库的 schema、复合键、ArrayBuffer 和 Blob 字节。成功更新及重新创建 AppModel 后内容保持一致；主动改写自身存储但不能渲染的隔离候选会被拒绝，原资源指针和所有原数据仍保留。真实官方 v3.29.1 ZIP 的两项已有测试也实际启用，下载包 SHA-256 为 `4f16cce229e223bd07b5a3daccfbfb8bf349d7335572d412959284ab6c9bab50`。
+
+上述本地验证没有访问生产 WebKit、个人 Remote 或 Keychain，也没有替换已安装的正式 App。随后用户批准发布 v1.0.1（Build 3），对应源码 CI 和签名发布的最终结果以 GitHub Actions 为准。没有把源码核对描述成两份真实官方发行之间的完整在线升级验收。端口迁移的格式限制仍保留，GeoIP 二进制库的跨 Origin 迁移尚未增加；这一边界见 [存储设计](STORAGE-DESIGN.md)。
+
+## 2026-10-23 的历史验证记录
+
 执行日期：2026-10-23，Asia/Shanghai。设备为 Apple Silicon arm64，运行 macOS 27.0.1（26A434），完整 Xcode 27.1（27A9275）。最低部署版本为 macOS 26.0，架构固定 arm64；未在独立 macOS 26.0 设备上运行。
 
 ## 首个 GitHub 正式版的发布候选验证

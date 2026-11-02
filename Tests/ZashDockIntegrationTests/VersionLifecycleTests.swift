@@ -45,6 +45,14 @@ struct VersionLifecycleTests {
   private func assertPage(_ model: AppModel, marker: String, storage: OriginStoragePayload)
     async throws
   {
+    try await assertRenderedStorage(model, marker: marker, storage: storage)
+    try await model.originStorage.verify(storage, at: try #require(model.session).origin)
+  }
+  // Same-Origin updates must preserve the real WebKit profile even when it contains
+  // databases which the separate port-transfer serializer cannot represent.
+  private func assertRenderedStorage(_ model: AppModel, marker: String, storage: OriginStoragePayload)
+    async throws
+  {
     #expect(model.phase == .ready)
     let session = try #require(model.session)
     #expect(
@@ -61,7 +69,116 @@ struct VersionLifecycleTests {
       [[String: String]].self, from: Data(try #require(decoded["setup/api-list"]).utf8))
     #expect(backends.count == 2 && backends.map { $0["uuid"] } == remoteIDs.map(Optional.some))
     #expect(decoded["setup/active-uuid"] == remoteIDs[1])
-    try await model.originStorage.verify(storage, at: session.origin)
+  }
+
+  private static let geoIPFixtureWriteScript = #"""
+    const open = (name, version, stores) => new Promise((resolve, reject) => {
+      const request = indexedDB.open(name, version);
+      request.onupgradeneeded = () => {
+        for (const store of stores) {
+          if (!request.result.objectStoreNames.contains(store)) request.result.createObjectStore(store);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = request.onblocked = () => reject(new Error('GeoIP fixture open'));
+    });
+    const key = 'earth:https://geoip.example.invalid/city.mmdb';
+    const bytes = new Uint8Array([0, 1, 127, 128, 255, ...new TextEncoder().encode(generation)]);
+    // These names, versions and out-of-line key stores match official Zashboard's
+    // GeoIP chunk store and legacy earth worker, including ArrayBuffer and Blob data.
+    const modern = await open('zashboard-geoip', 2, ['manifests', 'chunks']);
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = modern.transaction(['manifests', 'chunks'], 'readwrite');
+        const manifests = transaction.objectStore('manifests'), chunks = transaction.objectStore('chunks');
+        manifests.clear(); chunks.clear();
+        manifests.put({chunkCount:1, chunkSize:262144, generation, size:bytes.length, updatedAt:1700000000000}, key);
+        chunks.put(bytes.buffer, [key, generation, 0]);
+        transaction.oncomplete = resolve;
+        transaction.onerror = transaction.onabort = () => reject(new Error('GeoIP fixture write'));
+      });
+    } finally { modern.close(); }
+    const legacy = await open('zashboard-earth-geoip', 1, ['city-database']);
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = legacy.transaction('city-database', 'readwrite');
+        const store = transaction.objectStore('city-database');
+        store.clear();
+        store.put({blob:new Blob([bytes], {type:'application/octet-stream'}), storedAt:1700000000000}, 'legacy-city-cache');
+        transaction.oncomplete = resolve;
+        transaction.onerror = transaction.onabort = () => reject(new Error('Legacy GeoIP fixture write'));
+      });
+    } finally { legacy.close(); }
+    return true;
+    """#
+
+  private func seedGeoIPCaches(_ session: WebSession) async throws {
+    #expect(try await session.page.callJavaScript(Self.geoIPFixtureWriteScript,
+      arguments: ["generation": "geoip-generation-fixture"]) as? Bool == true)
+  }
+
+  /// A test-only independent inventory, rather than the production transfer codec.
+  /// It reads the random fixture profile, including schemas and structured-clone values.
+  private func webKitStorageInventory(_ session: WebSession) async throws -> String {
+    try #require(try await session.page.callJavaScript(#"""
+      const encode = async value => {
+        if (value instanceof Blob) return {kind:'blob', mime:value.type, bytes:[...new Uint8Array(await value.arrayBuffer())]};
+        if (value instanceof ArrayBuffer) return {kind:'array-buffer', bytes:[...new Uint8Array(value)]};
+        if (ArrayBuffer.isView(value)) return {kind:'view', bytes:[...new Uint8Array(value.buffer, value.byteOffset, value.byteLength)]};
+        if (Array.isArray(value)) return await Promise.all(value.map(encode));
+        if (value && typeof value === 'object') {
+          const result = {};
+          for (const key of Object.keys(value).sort()) result[key] = await encode(value[key]);
+          return result;
+        }
+        return value;
+      };
+      const result = {
+        localStorage:Object.keys(localStorage).sort().map(key => [key, localStorage.getItem(key)]),
+        databases:[]
+      };
+      const names = (await indexedDB.databases()).map(item => item.name).sort();
+      for (const name of names) {
+        const db = await new Promise((resolve, reject) => {
+          const request = indexedDB.open(name);
+          request.onupgradeneeded = () => { request.transaction.abort(); reject(new Error('Fixture database disappeared')); };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(new Error('Fixture inventory open'));
+        });
+        try {
+          const database = {name, version:db.version, stores:[]};
+          const raw = [];
+          await new Promise((resolve, reject) => {
+            const transaction = db.transaction([...db.objectStoreNames], 'readonly');
+            for (const storeName of [...db.objectStoreNames].sort()) {
+              const store = transaction.objectStore(storeName);
+              const entry = {name:storeName, keyPath:store.keyPath, autoIncrement:store.autoIncrement,
+                indexes:[...store.indexNames].sort().map(indexName => {
+                  const index = store.index(indexName);
+                  return {name:indexName, keyPath:index.keyPath, unique:index.unique, multiEntry:index.multiEntry};
+                }), records:[]};
+              raw.push(entry);
+              const request = store.openCursor();
+              request.onsuccess = () => {
+                if (request.result) {
+                  entry.records.push({key:request.result.primaryKey, value:request.result.value});
+                  request.result.continue();
+                }
+              };
+              request.onerror = () => { transaction.abort(); };
+            }
+            transaction.oncomplete = resolve;
+            transaction.onerror = transaction.onabort = () => reject(new Error('Fixture inventory read'));
+          });
+          for (const entry of raw) {
+            entry.records = await Promise.all(entry.records.map(async record => ({key:await encode(record.key), value:await encode(record.value)})));
+            database.stores.push(entry);
+          }
+          result.databases.push(database);
+        } finally { db.close(); }
+      }
+      return JSON.stringify(result);
+      """#) as? String)
   }
   private func prepare(
     _ store: VersionStore, paths: AppPaths, tag: String, marker: String, rendered: Bool = true
@@ -183,6 +300,54 @@ struct VersionLifecycleTests {
       let reopened = fixture.model(); await reopened.start()
       #expect(reopened.currentVersion == current && reopened.configuration.port == oldPort)
       try await assertPage(reopened, marker: "custom-offline-version", storage: expected)
+    }
+  }
+
+  @Test(.timeLimit(.minutes(1)))
+  func sameOriginUpdatePreservesGeoIPCachesAndTwoRemotesAcrossRestart() async throws {
+    try await withFixture { fixture, model in
+      let oldVersion = try #require(model.currentVersion)
+      let oldPort = model.configuration.port
+      let expected = try officialStorage()
+      try await writeStorage(model, values: expected)
+      try await seedGeoIPCaches(try #require(model.session))
+      let original = try await webKitStorageInventory(try #require(model.session))
+      #expect(original.contains("zashboard-geoip") && original.contains("zashboard-earth-geoip"))
+      #expect(original.contains("array-buffer") && original.contains("blob"))
+      try await install(localArchive(fixture.paths, marker: "same-origin-geoip-update"), into: model)
+      let current = try #require(model.currentVersion)
+      #expect(current.id != oldVersion.id && model.errorMessage == nil)
+      #expect(model.configuration.port == oldPort && model.session?.origin.port == Int(oldPort))
+      #expect(try await model.store?.current() == current)
+      #expect(try directoryCount(fixture.paths) == 1)
+      try await assertRenderedStorage(model, marker: "same-origin-geoip-update", storage: expected)
+      #expect(try await webKitStorageInventory(try #require(model.session)) == original)
+      await fixture.shutdown(model)
+      let restarted = fixture.model(); await restarted.start()
+      #expect(restarted.currentVersion == current && restarted.configuration.port == oldPort)
+      try await assertRenderedStorage(restarted, marker: "same-origin-geoip-update", storage: expected)
+      #expect(try await webKitStorageInventory(try #require(restarted.session)) == original)
+    }
+  }
+
+  @Test(.timeLimit(.minutes(1)))
+  func rejectedSameOriginCandidateKeepsGeoIPCachesAndTwoRemotesIntact() async throws {
+    try await withFixture { fixture, model in
+      let current = try #require(model.currentVersion)
+      let oldPort = model.configuration.port
+      let expected = try officialStorage()
+      try await writeStorage(model, values: expected)
+      try await seedGeoIPCaches(try #require(model.session))
+      let original = try await webKitStorageInventory(try #require(model.session))
+      let pointer = fixture.paths.root.appendingPathComponent("versions-state.json")
+      let pointerBytes = try Data(contentsOf: pointer)
+      try await install(localArchive(fixture.paths, marker: "rejected-geoip-candidate", rendered: false), into: model)
+      #expect(model.currentVersion == current && model.configuration.port == oldPort)
+      #expect(model.phase == .ready && model.errorMessage?.contains("未正常渲染") == true)
+      #expect(try Data(contentsOf: pointer) == pointerBytes)
+      #expect(try directoryCount(fixture.paths) == 1)
+      try await assertRenderedStorage(model, marker: "version-initial", storage: expected)
+      #expect(try await webKitStorageInventory(try #require(model.session)) == original)
     }
   }
 
@@ -320,15 +485,17 @@ struct VersionLifecycleTests {
     let rejectedMutation =
       rendered
       ? ""
-      : #"""
+      : """
       localStorage.clear();localStorage.setItem('failed-candidate','must-not-reach-live-origin');
       (async()=>{
        for(const name of ['base64','connection-history']){
-        const db=await new Promise(resolve=>{const request=indexedDB.open(name);request.onsuccess=()=>resolve(request.result);});
+        const db=await new Promise(resolve=>{const request=indexedDB.open(name,1);request.onupgradeneeded=()=>request.result.createObjectStore(name,{keyPath:'key'});request.onsuccess=()=>resolve(request.result);});
         await new Promise(resolve=>{const transaction=db.transaction(name,'readwrite');transaction.objectStore(name).clear();transaction.oncomplete=resolve;});db.close();
        }
+       const generation='rejected-candidate';
+       \(Self.geoIPFixtureWriteScript)
       })().catch(()=>{});
-      """#
+      """
     let html = """
       <!doctype html><html><head><script>
       \(originFirstReadFixtureScript)

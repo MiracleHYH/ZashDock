@@ -8,11 +8,11 @@ ZashDock 是仅面向 Apple Silicon 的 macOS 原生 Zashboard 容器：从 [Zep
 
 2026-10-23 审计修复已通过 P1、P2 阶段编译与回归，详情见 [修复记录](Docs/REMEDIATION.md)。现已采用“WebKit 日常持久化＋改端口时一次性转移完整业务数据”，移除了持续同步的原生配置副本和相关恢复界面。
 
-## 首个正式版准备
+## 正式版分发
 
-计划通过 GitHub Releases 直接分发正式版 **`v1.0.0`**，应用内版本为 **`1.0.0 (2)`**，要求 Apple Silicon、macOS 26.0+，不需要上架 App Store。产品版本和 Apple 分发身份分别记录：本次选择正式版发行，使用实际 Release 构建和 **ad hoc 签名**；维护者目前没有 Apple Developer Program 会员，没有 Developer ID 签名、Apple 公证或装订。**Gatekeeper 可能阻止下载后的应用启动**；ad hoc 签名不提供 Apple 验证的开发者身份，也不能保证每台 Mac 上的首次启动体验。相关要求见 [Apple 软件分发说明](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)。
+通过 GitHub Releases 直接分发正式版，当前发行源码对应 **`v1.0.1`**，应用内版本为 **`1.0.1 (3)`**，要求 Apple Silicon、macOS 26.0+，不需要上架 App Store。产品版本和 Apple 分发身份分别记录：使用实际 Release 构建和 **ad hoc 签名**；维护者目前没有 Apple Developer Program 会员，没有 Developer ID 签名、Apple 公证或装订。**Gatekeeper 可能阻止下载后的应用启动**；ad hoc 签名不提供 Apple 验证的开发者身份，也不能保证每台 Mac 上的首次启动体验。确认下载来源后可按 [Apple 官方说明](https://support.apple.com/zh-cn/102445)，在“系统设置 → 隐私与安全性”选择 ZashDock 的“仍要打开”。
 
-此正式版计划进入稳定 Sparkle Feed，更新包与 Feed 均使用专用 Ed25519 密钥签名；该更新完整性验证独立于 Apple 的 Developer ID 和公证。发行同时提供应用 ZIP、SHA-256、匹配 dSYM 与白名单构建信息；归档检查和对应源码提交的 CI 通过后才发布。功能与验证边界见 [v1.0.0 发行说明](https://github.com/MiracleHYH/ZashDock/blob/main/Docs/RELEASE-NOTES-1.0.0.md)。实际可用版本以仓库 [Releases](https://github.com/MiracleHYH/ZashDock/releases) 为准。
+稳定 Sparkle Feed 的更新包与 Feed 均使用专用 Ed25519 密钥签名；该更新完整性验证独立于 Apple 的 Developer ID 和公证。发行同时提供应用 ZIP、SHA-256、匹配 dSYM 与白名单构建信息；归档检查和对应源码提交的 CI 通过后才发布。v1.0.1 修复同端口更新被 GeoIP 数据库拦截的问题；范围与验证边界见 [v1.0.1 发行说明](https://github.com/MiracleHYH/ZashDock/blob/main/Docs/RELEASE-NOTES-1.0.1.md)。实际可用版本以仓库 [Releases](https://github.com/MiracleHYH/ZashDock/releases) 为准。
 
 ## 构建与运行
 
@@ -36,11 +36,17 @@ xcodebuild -project ZashDock.xcodeproj \
 
 产物位于 `build/Xcode/Build/Products/Debug/ZashDock.app`。上述命令生成供本机开发使用的 ad hoc Debug 构建。GitHub 正式版可显式选择 ad hoc Release 模式；Developer ID 签名与 Apple 公证另需相应开发者身份。
 
+日常使用请从 [GitHub Releases](https://github.com/MiracleHYH/ZashDock/releases) 下载并将正式版安装到“应用程序”。目录的聚焦搜索排除和 Launch Services 注销不能保证清除应用建议。`Scripts/build-debug.sh` 因此默认在编译、验签成功后，将 `build` 内本项目的 App 逐一压缩，解压比较内容通过后才移除可运行副本。ZIP、摘要及原路径保存在 `build/DevelopmentAppArchives/`，源码、日志、dSYM、测试结果和已安装正式版保持不变。
+
+需要运行调试版时使用 `Scripts/build-debug.sh --keep-app`，或从 Xcode 运行；结束后执行 `Scripts/archive-build-apps.sh`。该清理只处理本项目 `build` 内 Bundle ID 为 `app.zashdock.*` 的 App，检测到正在运行的开发 App 会停止；不访问用户的 WebKit 数据。搜索隐私中排除 `build` 可作为辅助措施，不能用 `mdfind` 结果代替聚焦界面验收。
+
 仓库也提供 SwiftPM 辅助命令：
 
 ```sh
 Scripts/swift-build.sh       # 编译原生应用和本地 Core 包
-Scripts/build-debug.sh       # 生成 build/Debug/ZashDock.app 并进行本机签名
+Scripts/build-debug.sh       # 构建、验签，默认归档并清理可运行开发 App
+Scripts/build-debug.sh --keep-app # 明确保留 build/Debug/ZashDock.app 供调试
+Scripts/archive-build-apps.sh # 调试后验证归档并清理开发 App
 Scripts/test-core.sh         # Core 单元测试
 Scripts/test-integration.sh  # WebKit 集成测试
 Scripts/test-storage-processes.sh # 隔离 WebKit profile 的真实跨进程持久化与强退测试
@@ -100,7 +106,7 @@ external-controller-cors:
 
 从系统菜单栏 **ZashDock → 设置…** 或 **⌘,** 打开原生设置窗口。主窗口不放右上角设置或版本控件。**设置 → 更新** 和 **关于** 页均同时显示明确标注的 ZashDock 完整版本（含构建号）与 Zashboard 版本；系统菜单 **关于 ZashDock** 的原生面板也同时显示两者。更新页另提供 Zashboard 最新稳定版和安装入口。
 
-应用只保留当前安装，不提供 Zashboard 回滚、历史下载列表或历史保留数。候选先使用临时 WebKit 存储验证实际网页及本地服务版本，通过后才提交当前指针，再加载日常持久 profile。候选失败或取消时原安装和网页数据保留；成功加载后清理旧资源。旧版已有历史目录在当前安装确认可用后清理，用户的 Remote、设置及背景/历史数据库独立保留。
+应用只保留当前安装，不提供 Zashboard 回滚、历史下载列表或历史保留数。候选先使用全新空的临时 WebKit 存储验证实际网页及本地服务版本，通过后才提交当前指针，再以原端口加载原持久 profile。同端口更新不读取或复制用户存储，不受端口迁移器支持的数据库格式限制，GeoIP 等额外 IndexedDB 原地保留。候选失败或取消时原安装和网页数据保留；成功加载后清理旧资源。旧版已有历史目录在当前安装确认可用后清理，用户的 Remote、设置及背景/历史数据库独立保留。
 
 若指针提交后的持久页面加载失败，保留已提交安装与暂未清理的原资源，显示重载入口。这是失败恢复的临时资源保全，未向用户提供版本回滚功能。
 
@@ -112,9 +118,9 @@ external-controller-cors:
 
 ZashDock 使用 MIT License；App 资源内保留本项目及 Sparkle 的完整许可文本，包含 Sparkle 所用组件的通知，“关于”页也提供许可链接。
 
-应用固定使用 `main/appcast.xml` 的 HTTPS 更新源，并要求更新源及更新包的 Ed25519 签名有效。公钥随应用发布，专用私钥不提交源码；签名失败不会在一段时间后自动回退为无签名 Feed。首次源码推送提供了签名的空更新源；`v1.0.0` 正式版计划在发行验证完成后将签名条目写入稳定 Feed。
+应用固定使用 `main/appcast.xml` 的 HTTPS 更新源，并要求更新源及更新包的 Ed25519 签名有效。公钥随应用发布，专用私钥不提交源码；签名失败不会在一段时间后自动回退为无签名 Feed。`v1.0.0` 已于 2026-10-23 进入稳定 Feed；后续发行沿用相同更新身份。
 
-推送和 Pull Request 只触发构建、测试和 Debug 工件上传。正式发布须手动运行 `Publish signed ZashDock` 工作流并输入 `PUBLISH`，通过 `signing_mode` 显式选择 Apple 分发模式：默认 `developer-id` 要求 Developer ID 签名、公证和装订；本次选择 `adhoc`，明确保留未公证限制。两种模式均要求 Sparkle 对更新包和 Feed 签名并独立验证，成功后才创建正式 GitHub Release 并更新 Feed；缺少所选模式的必需凭据时停止，不隐式切换模式。正式版使用 Build `2`，供此前 Build `1` 的试用安装识别更新；后续发行 Build 必须大于 `2` 并持续递增。所需配置和失败恢复步骤见 [发布说明](Docs/RELEASING.md)。
+推送和 Pull Request 只触发构建、测试和 Debug 工件上传。正式发布须手动运行 `Publish signed ZashDock` 工作流并输入 `PUBLISH`，通过 `signing_mode` 显式选择 Apple 分发模式：默认 `developer-id` 要求 Developer ID 签名、公证和装订；本次选择 `adhoc`，明确保留未公证限制。两种模式均要求 Sparkle 对更新包和 Feed 签名并独立验证，成功后才创建正式 GitHub Release 并更新 Feed；缺少所选模式的必需凭据时停止，不隐式切换模式。v1.0.1 使用 Build `3`，供 v1.0.0 Build `2` 的安装识别更新；后续发行 Build 必须继续递增。所需配置和失败恢复步骤见 [发布说明](Docs/RELEASING.md)。
 
 ## 进一步阅读
 
