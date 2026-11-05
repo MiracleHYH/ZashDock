@@ -9,6 +9,7 @@
 | Core | 汇总 83 项 / 6 suites，通过；1 项可选官方在线下载按条件跳过 | 本轮工具执行回显，4.533 秒，未保存独立日志 |
 | SwiftPM 集成测试 | 汇总 72 项 / 16 suites 通过；实际 App 宿主安全测试、两项真实官方 ZIP 和可选个人后端测试按条件跳过 | `build/design-review/integration-final.log` |
 | 最终实际 Xcode 沙箱 App | **69 项通过、3 项按条件跳过、0 失败**；汇总 72 项 / 16 suites，32.490 秒；动态参数展开后 77 个通过的 test runs | `build/design-review/native-final.xcresult`、`native-final.log`、`native-final-summary.json` |
+| 发布前渲染等待修复后完整沙箱回归 | **69 项通过、3 项按条件跳过、0 失败**；汇总 72 项 / 16 suites，24.565 秒；包含页面计时器受阻参数，动态展开后 78 个通过的 test runs | `build/release-1.1.0/runtime-fix-full.xcresult`、`runtime-fix-full.log`、`runtime-fix-full-summary.json` |
 | 最终源码跨进程恢复 | 7 个独立 PID 通过；旧地址被占时自动迁移、外部观测真实配置提交后 SIGKILL、两次冷启动及旧业务数据清理，sentinel 连接数为 0 | `build/design-review/appmodel-processes-final.log`、`build/verification/appmodel-processes.8Kxzhz/` |
 | 发行前独立存储进程 | 19 个独立 PID 通过；持久化、提交前/提交后 SIGKILL 与旧地址 0 次连接 | `build/release-1.1.0/storage-processes.log`、`build/verification/storage-processes.fMRVLT/` |
 | 发布配置检查 | 14 项通过，覆盖模式显式选择、凭据隔离、非法输入和本地发布拒绝 | `build/release-1.1.0/release-profiles.log` |
@@ -25,6 +26,8 @@ Xcode 已验证实际 App Sandbox 和更新权限配置；本轮未提供真实�
 随后按用户要求构建相同源码的本机 ad hoc Release 试用包，沿用已有安装的 Bundle ID、版本 `1.0.1 (3)` 和权限。旧应用先 ZIP 备份、解压比对，再通过同卷暂存替换 `/Applications/ZashDock.app`，签名和 127 项文件树比较通过；证据为 `build/local-trial/build.log`、`install.log`。首次启动已自动迁移到高位地址，主窗口曾短暂显示空白；正常退出后冷启动，CUA 确认原有面板及四组代理内容正常加载、通用设置无端口项。没有据此认定空白原因或声称长期运行已验收。构建目录重复 App 已验证归档，正式安装留供试用。
 
 用户之后明确授权发布。工程准备递增为 `1.1.0 (4)`；新发行对应提交的 GitHub CI、Release 构建和签名结果仍须以实际运行核验，不用上述试用包或旧版 Feed 代替。
+
+首次源码 CI（`41963540564`）通过；首轮签名发布（`41969810949`）在加载凭据前的空白页恢复测试失败，未创建新 Release 或修改 Feed。后续确定性实验保留页面定时器回调但不执行，复现了相同的三个失败断言；调试状态显示导航已被观察到、初始文档已验证，但后续渲染校验仍在等待。改用 Swift `ContinuousClock` 与 `Task.sleep` 轮询 DOM，保留 8 秒渲染等待、15 秒测试断言及页内 Origin/版本/nonce 校验后，3 项定向测试全部通过（空白页含正常/受阻计时器两个参数）。证据为 `build/release-1.1.0/runtime-timer-reproduced.log` 和 `runtime-timer-fixed.log`。这证明旧计时器依赖可导致悬挂，不证明首轮远端失败一定由后台节流引起；单次 WebContent IPC 完全无响应也不因此获得严格硬超时保证。
 
 ## 同端口更新与 GeoIP 缓存兼容修复（2026-11-02）
 

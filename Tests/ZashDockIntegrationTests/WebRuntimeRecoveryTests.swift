@@ -45,14 +45,18 @@ struct WebRuntimeRecoveryTests {
         }
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func blankDocumentAndIntentionalJavaScriptClearDoNotReintroduceAnOlderSeed() async throws {
+    @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+    func blankDocumentAndIntentionalJavaScriptClearDoNotReintroduceAnOlderSeed(blockedPageTimers: Bool) async throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ZashDockRuntimeDocument-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try Data("<div id='app'>Ready</div>".utf8).write(to: root.appendingPathComponent("index.html"))
-        try Data("<div id='app'></div><script>localStorage.clear();</script>".utf8).write(to: root.appendingPathComponent("blank.html"))
+        // A page can override or defer its timers. The wrapper's render deadline must
+        // still detect the empty document without relying on that page's timer queue.
+        // Retain callbacks so WebKit cannot reject the pending JS promise as unreachable.
+        let timerOverride = blockedPageTimers ? "window.pendingTimers = []; window.setTimeout = callback => { window.pendingTimers.push(callback); return 0; };" : ""
+        try Data("<div id='app'></div><script>localStorage.clear();\(timerOverride)</script>".utf8).write(to: root.appendingPathComponent("blank.html"))
         let server = try await bindFixture(root)
         defer { server.stop() }
         let dataStore = WKWebsiteDataStore.nonPersistent()

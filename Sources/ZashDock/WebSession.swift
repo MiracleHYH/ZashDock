@@ -95,22 +95,29 @@ final class WebSession {
         verifiedInitialDocument = true
     }
     private func verifyDocument() async throws {
-        let valid = try await page.callJavaScript("""
-            if (location.origin !== expected) return false;
-            const deadline = Date.now() + 8000;
-            while (Date.now() < deadline) {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(8))
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            // The page owns its timers and can defer or replace them. Keep the render
+            // wait in the native task; each JS call only inspects the current document.
+            let state = try await page.callJavaScript("""
+                if (location.origin !== expected) return 'invalid';
                 const app = document.getElementById('app');
-                if (app && (app.childElementCount > 0 || app.textContent.trim().length > 0)) {
-                    const response = await fetch('/__zashdock_health', {cache: 'no-store'});
-                    if (!response.ok) return false;
-                    const health = await response.json();
-                    return (!version || health.version === version) && (!nonce || health.nonce === nonce);
-                }
-                await new Promise(resolve => setTimeout(resolve, 50));
+                if (!app || (app.childElementCount === 0 && app.textContent.trim().length === 0)) return 'waiting';
+                const response = await fetch('/__zashdock_health', {cache: 'no-store'});
+                if (!response.ok) return 'invalid';
+                const health = await response.json();
+                return (!version || health.version === version) && (!nonce || health.nonce === nonce) ? 'valid' : 'invalid';
+                """, arguments: ["expected": "http://127.0.0.1:\(origin.port!)", "version": expectedVersion ?? "", "nonce": expectedNonce ?? ""]) as? String
+            try Task.checkCancellation()
+            if state == "valid" { return }
+            guard state == "waiting" else {
+                throw ZashDockError.verification("Zashboard 未正常渲染，或本地服务版本验证失败。")
             }
-            return false;
-            """, arguments: ["expected": "http://127.0.0.1:\(origin.port!)", "version": expectedVersion ?? "", "nonce": expectedNonce ?? ""])
-        guard valid as? Bool == true else { throw ZashDockError.verification("Zashboard 未正常渲染，或本地服务版本验证失败。") }
+            try await clock.sleep(until: min(deadline, clock.now.advanced(by: .milliseconds(50))))
+        }
+        throw ZashDockError.verification("Zashboard 未正常渲染，或本地服务版本验证失败。")
     }
     private func observe(_ event: WebPage.NavigationEvent) {
         guard verifiedInitialDocument, !stopped, !hasRuntimeFailure else { return }
