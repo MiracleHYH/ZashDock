@@ -16,6 +16,7 @@ struct ConfigurationMetadataTests {
         let decoded = try JSONDecoder().decode(AppConfiguration.self, from: bytes)
         #expect(decoded.port == 23456 && decoded.quitAfterLastWindowCloses)
         #expect(decoded.pendingOriginCleanup == nil && !decoded.legacyStorageImported)
+        #expect(!decoded.automaticPortSelection)
         try withStore { store, _ in
             try bytes.write(to: store.url)
             #expect(try store.load() == decoded)
@@ -38,7 +39,7 @@ struct ConfigurationMetadataTests {
             for url in [store.url, store.recoveryCopyURL] {
                 let encoded = try Data(contentsOf: url)
                 let fields = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
-                #expect(Set(fields.keys) == ["port", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
+                #expect(Set(fields.keys) == ["port", "automaticPortSelection", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
             }
         }
     }
@@ -52,7 +53,10 @@ struct ConfigurationMetadataTests {
         (#""pendingOriginCleanup":9099"#, .invalidValues),
         (#""legacyStorageImported":0"#, .invalidFields),
         (#""legacyStorageImported":"false""#, .invalidFields),
-        (#""legacyStorageImported":null"#, .invalidFields)
+        (#""legacyStorageImported":null"#, .invalidFields),
+        (#""automaticPortSelection":0"#, .invalidFields),
+        (#""automaticPortSelection":"true""#, .invalidFields),
+        (#""automaticPortSelection":null"#, .invalidFields)
     ])
     func invalidMetadataIsRejectedWithoutChangingPrimaryOrMirror(field: String, kind: ConfigurationLoadFailure.Kind) throws {
         try withStore { store, _ in
@@ -80,7 +84,7 @@ struct ConfigurationMetadataTests {
             #expect(store.recoverableConfiguration() == committed)
             let bytes = try Data(contentsOf: store.recoveryCopyURL)
             let fields = try #require(try JSONSerialization.jsonObject(with: bytes) as? [String: Any])
-            #expect(Set(fields.keys) == ["port", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
+            #expect(Set(fields.keys) == ["port", "automaticPortSelection", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
             #expect(bytes.count < 256)
             let mode = try FileManager.default.attributesOfItem(atPath: store.recoveryCopyURL.path)[.posixPermissions] as? NSNumber
             #expect(mode?.intValue == 0o600)

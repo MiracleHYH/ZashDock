@@ -110,13 +110,15 @@ private final class HarnessDelegate: NSObject, NSApplicationDelegate {
             let identity = FixtureIdentity(fixture: FixtureIdentity.marker, profile: UUID(), oldPort: oldPort, newPort: newPort)
             try AtomicFile.encode(identity, to: identityURL)
             var configuration = AppConfiguration(); configuration.port = oldPort
+            configuration.automaticPortSelection = true
             try ConfigurationStore(url: paths.configuration).save(configuration)
             try writeInstallation(paths)
             try report(mode, at: root, configuration: configuration)
             NSApp.terminate(nil); return
         }
         let identity = try AtomicFile.decode(FixtureIdentity.self, from: identityURL)
-        guard identity.fixture == FixtureIdentity.marker, identity.oldPort >= 1024, identity.newPort >= 1024,
+        guard identity.fixture == FixtureIdentity.marker,
+              AutomaticPortPolicy.range.contains(identity.oldPort), AutomaticPortPolicy.range.contains(identity.newPort),
               identity.oldPort != identity.newPort else { throw HarnessFailure.invalidArguments }
         if mode == "sentinel" {
             for attempt in 0..<100 {
@@ -141,18 +143,23 @@ private final class HarnessDelegate: NSObject, NSApplicationDelegate {
         }
         let store = WKWebsiteDataStore(forIdentifier: identity.profile)
         dataStore = store
-        let appModel = AppModel(paths: paths, dataStore: store, legacyKeyReader: DeniedKeyReader())
+        let migrationPort = identity.newPort
+        let appModel = AppModel(paths: paths, dataStore: store, legacyKeyReader: DeniedKeyReader(),
+                                portCandidates: { excluded in excluded.contains(migrationPort) ? [] : [migrationPort] })
         model = appModel
+        if mode == "transfer" {
+            let committed = try ConfigurationStore(url: paths.configuration).load()
+            guard committed.port == identity.oldPort, committed.automaticPortSelection else { throw HarnessFailure.fixtureMismatch }
+            // The shell begins watching before production startup binds the occupied old port.
+            try report("transfer-started", at: root, configuration: committed)
+        }
         await appModel.start()
         if mode == "transfer" {
-            // The real startup must encounter the separately occupied old port first.
-            guard appModel.phase == .unavailable, appModel.session == nil,
-                  appModel.currentVersion != nil, appModel.configuration.port == identity.oldPort else { throw HarnessFailure.startupFailed }
-            try report("transfer-started", at: root, configuration: appModel.configuration)
-            try await appModel.changePort(to: identity.newPort)
+            // Production startup must recover automatically; the fixture only fixes candidate order.
+            guard appModel.phase == .ready, appModel.configuration.port == identity.newPort else { throw HarnessFailure.startupFailed }
             try await assertStoredFixture(appModel, expectedPort: identity.newPort)
             try report(mode, at: root, configuration: appModel.configuration)
-            // Shell may kill during changePort cleanup, or here if cleanup already completed.
+            // Shell may kill during automatic migration cleanup, or here if cleanup completed.
             return
         }
         let expectedPort = mode == "verify-new" || mode == "verify-new-again" ? identity.newPort : identity.oldPort
@@ -186,9 +193,10 @@ private final class HarnessDelegate: NSObject, NSApplicationDelegate {
               value["localStorage"] as? [String: String] == localStorage,
               value["databases"] as? [String: [String: String]] == databases else { throw HarnessFailure.fixtureMismatch }
         let saved = try ConfigurationStore(url: model.paths!.configuration).load()
-        guard saved.port == expectedPort, model.currentVersion?.source == .githubRelease else { throw HarnessFailure.fixtureMismatch }
+        guard saved.port == expectedPort, saved.automaticPortSelection,
+              model.currentVersion?.source == .githubRelease else { throw HarnessFailure.fixtureMismatch }
         let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: model.paths!.configuration)) as? [String: Any]
-        guard let metadata, Set(metadata.keys).isSubset(of: ["port", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
+        guard let metadata, Set(metadata.keys).isSubset(of: ["port", "automaticPortSelection", "quitAfterLastWindowCloses", "pendingOriginCleanup", "legacyStorageImported"])
         else { throw HarnessFailure.fixtureMismatch }
     }
     private func report(_ phase: String, at root: URL, configuration: AppConfiguration) throws {
@@ -198,18 +206,19 @@ private final class HarnessDelegate: NSObject, NSApplicationDelegate {
     }
     private func origin(_ port: UInt16) -> URL { URL(string: "http://127.0.0.1:\(port)")! }
     private func availablePort(excluding: UInt16? = nil) throws -> UInt16 {
-        for _ in 0..<20 {
+        for candidate in AutomaticPortPolicy.candidates(excluding: excluding.map { [$0] } ?? [], limit: 20) {
             let descriptor = socket(AF_INET, SOCK_STREAM, 0)
             guard descriptor >= 0 else { throw HarnessFailure.unavailablePort }
             var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             address.sin_family = sa_family_t(AF_INET); address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+            address.sin_port = candidate.bigEndian
             var length = socklen_t(MemoryLayout<sockaddr_in>.size)
             let result = withUnsafeMutablePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, length) == 0 && getsockname(descriptor, $0, &length) == 0 }
             }
             close(descriptor)
             let port = UInt16(bigEndian: address.sin_port)
-            if result, port >= 1024, port != excluding { return port }
+            if result, AutomaticPortPolicy.range.contains(port), port != excluding { return port }
         }
         throw HarnessFailure.unavailablePort
     }

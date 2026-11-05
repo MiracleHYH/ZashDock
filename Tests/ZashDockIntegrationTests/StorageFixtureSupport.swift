@@ -47,6 +47,7 @@ func withStorageAppFixture(_ body: (AppPaths, WKWebsiteDataStore, InstalledVersi
     let version = try writePersistedInstallation(paths)
     let listener = try await bindFixture(version.directoryURL)
     var configuration = AppConfiguration(); configuration.port = listener.port
+    configuration.automaticPortSelection = true
     listener.stop(); try ConfigurationStore(url: paths.configuration).save(configuration)
     try await body(paths, .nonPersistent(), version)
 }

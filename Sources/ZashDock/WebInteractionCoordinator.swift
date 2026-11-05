@@ -233,12 +233,17 @@ final class WebInteractionCoordinator: WebPage.DialogPresenting {
     func receiveExport(_ body: Any, trustedFrame: Bool) async -> ExportResult {
         guard trustedFrame, !stopped, !busy, let deadline = gestureDeadline, .now <= deadline else { return .rejected }
         gestureDeadline = nil // A malformed request also consumes the one-use authorization.
-        guard let payload = WebExportPayload(body) else { return .rejected }
         busy = true; defer { busy = false }
         let generation = documentGeneration
+        guard let payload = WebExportPayload(body) else {
+            // Feedback has exactly the same frame, gesture and one-use boundary as saving.
+            // Untrusted/background messages above cannot cause a native alert.
+            await panels.alert(Self.exportRejectionMessage(body))
+            return .rejected
+        }
         guard let destination = await panels.chooseSaveDestination(suggestedName: payload.suggestedName, contentType: payload.contentType), !stopped,
               generation == documentGeneration else { return .cancelled }
-        guard destination.isFileURL else { return .rejected }
+        guard destination.isFileURL else { await panels.exportFailed(); return .rejected }
         let scoped = destination.startAccessingSecurityScopedResource()
         defer { if scoped { destination.stopAccessingSecurityScopedResource() } }
         do {
@@ -248,6 +253,17 @@ final class WebInteractionCoordinator: WebPage.DialogPresenting {
             await panels.exportFailed()
             return .failed
         }
+    }
+    private static func exportRejectionMessage(_ body: Any) -> String {
+        if let fields = body as? [String: Any], Set(fields.keys) == ["schema", "exportError"],
+           let schema = fields["schema"] as? NSNumber, CFGetTypeID(schema) != CFBooleanGetTypeID(), schema == 1 {
+            switch fields["exportError"] as? String {
+            case "tooLarge": return "文件超过 16 MiB 的导出上限。请选择更小的文件后重试。"
+            case "unavailable": return "导出文件已失效或暂时无法读取。请重新点击导出。"
+            default: break
+            }
+        }
+        return "导出文件的格式或名称无效。请重新导出，或选择其他文件后重试。"
     }
     isolated deinit { stop() }
     func stop() {
@@ -285,21 +301,27 @@ final class WebInteractionCoordinator: WebPage.DialogPresenting {
           const create = URL.createObjectURL.bind(URL), revoke = URL.revokeObjectURL.bind(URL);
           URL.createObjectURL = value => {
             const url = create(value);
-            if (value instanceof Blob && value.size <= \(WebExportPayload.maximumBytes) && blobs.size < 32) blobs.set(url, value);
+            if (value instanceof Blob && blobs.size < 32) blobs.set(url, value.size <= \(WebExportPayload.maximumBytes) ? {blob:value} : {error:'tooLarge'});
             return url;
           };
           URL.revokeObjectURL = url => { blobs.delete(String(url)); return revoke(url); };
           const report = status => dispatchEvent(new CustomEvent('zashdock-export-result', {detail: status}));
           const exportAnchor = anchor => {
             if (!anchor.hasAttribute('download') || !anchor.href.startsWith('blob:' + location.origin + '/')) return false;
-            const blob = blobs.get(anchor.href); // retain bytes before the official helper immediately revokes its URL
-            if (!blob) { report('rejected'); return true; }
+            const entry = blobs.get(anchor.href); // retain bytes before the official helper immediately revokes its URL
             const filename = anchor.download || 'zashboard-export';
             (async () => {
-              const bytes = new Uint8Array(await blob.arrayBuffer());
-              let binary = '';
-              for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
-              const result = await window.webkit.messageHandlers.zashdockExport.postMessage({schema:1,filename,mime:blob.type || 'application/octet-stream',base64:btoa(binary)});
+              let request;
+              if (!entry || entry.error) request = {schema:1,exportError:entry?.error || 'unavailable'};
+              else {
+                try {
+                  const bytes = new Uint8Array(await entry.blob.arrayBuffer());
+                  let binary = '';
+                  for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+                  request = {schema:1,filename,mime:entry.blob.type || 'application/octet-stream',base64:btoa(binary)};
+                } catch { request = {schema:1,exportError:'unavailable'}; }
+              }
+              const result = await window.webkit.messageHandlers.zashdockExport.postMessage(request);
               report(result.status);
             })().catch(() => report('failed'));
             return true;

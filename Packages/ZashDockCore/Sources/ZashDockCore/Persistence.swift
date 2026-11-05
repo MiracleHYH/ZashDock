@@ -119,6 +119,7 @@ public struct ConfigurationStore: Sendable {
         }
         var value = AppConfiguration()
         value.port = UInt16(fields.port)
+        value.automaticPortSelection = fields.automaticPortSelection
         value.quitAfterLastWindowCloses = fields.quitAfterLastWindowCloses
         value.pendingOriginCleanup = fields.pendingOriginCleanup.map(UInt16.init)
         value.legacyStorageImported = fields.legacyStorageImported
@@ -150,11 +151,13 @@ public struct ConfigurationStore: Sendable {
         var recovered = defaults
         if let origin = existing.flatMap({ try? decode($0) }) ?? recoverableConfiguration() {
             recovered.port = origin.port
+            recovered.automaticPortSelection = origin.automaticPortSelection
             recovered.pendingOriginCleanup = origin.pendingOriginCleanup
             recovered.legacyStorageImported = origin.legacyStorageImported
         } else if let preservingPort {
             guard preservingPort >= 1024 else { throw ZashDockError.invalidConfiguration("原端口必须在 1024–65535 之间。") }
             recovered.port = preservingPort
+            recovered.automaticPortSelection = false
         } else {
             throw ZashDockError.invalidConfiguration("无法确认原本地端口。请指定原端口后再恢复应用设置，以保留该 Origin 的网页数据。")
         }
@@ -194,16 +197,19 @@ public struct ConfigurationStore: Sendable {
 
     private struct ConfigurationFields: Decodable {
         let port: Int
+        let automaticPortSelection: Bool
         let quitAfterLastWindowCloses: Bool
         let pendingOriginCleanup: Int?
         let legacyStorageImported: Bool
 
         private enum CodingKeys: String, CodingKey {
-            case port, quitAfterLastWindowCloses, pendingOriginCleanup, legacyStorageImported
+            case port, automaticPortSelection, quitAfterLastWindowCloses, pendingOriginCleanup, legacyStorageImported
         }
         init(from decoder: any Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             port = try fields.decode(Int.self, forKey: .port)
+            automaticPortSelection = fields.contains(.automaticPortSelection)
+                ? try fields.decode(Bool.self, forKey: .automaticPortSelection) : false
             quitAfterLastWindowCloses = try fields.decode(Bool.self, forKey: .quitAfterLastWindowCloses)
             pendingOriginCleanup = try fields.decodeIfPresent(Int.self, forKey: .pendingOriginCleanup)
             legacyStorageImported = fields.contains(.legacyStorageImported)

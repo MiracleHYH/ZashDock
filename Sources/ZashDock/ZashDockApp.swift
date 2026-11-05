@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import SwiftUI
 import WebKit
 import UniformTypeIdentifiers
@@ -10,6 +11,7 @@ struct ZashDockApp: App {
     @Environment(\.openWindow) private var openWindow
     @State private var model = AppModel()
     @State private var wrapperUpdater = WrapperUpdateController()
+    @State private var settingsNavigation = SettingsNavigation()
     var body: some Scene {
         Window("ZashDock", id: "main") {
             MainWindow(model: model).task {
@@ -21,14 +23,23 @@ struct ZashDockApp: App {
                 }
             }
         }.defaultSize(width: 1160, height: 780)
-            .commands { ZashDockCommands(model: model, wrapperUpdater: wrapperUpdater) }
-        Settings { SettingsView(model: model, wrapperUpdater: wrapperUpdater) }
+            .commands { ZashDockCommands(model: model, wrapperUpdater: wrapperUpdater, navigation: settingsNavigation) }
+        Settings { SettingsView(model: model, wrapperUpdater: wrapperUpdater, navigation: settingsNavigation) }
     }
 }
 
+enum SettingsTab: Hashable { case general, updates, about }
+
+@Observable
+final class SettingsNavigation {
+    var selection: SettingsTab = .general
+}
+
 struct ZashDockCommands: Commands {
+    @Environment(\.openSettings) private var openSettings
     let model: AppModel
     let wrapperUpdater: WrapperUpdateController
+    let navigation: SettingsNavigation
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
             Button("关于 ZashDock") { showAbout() }
@@ -38,9 +49,22 @@ struct ZashDockCommands: Commands {
                 .disabled(!wrapperUpdater.canCheckForUpdates)
         }
         CommandGroup(after: .toolbar) {
-            Button("重新载入 Zashboard") { model.reload() }
+            Button("重新载入 Zashboard 面板") { model.reload() }
                 .keyboardShortcut("r").disabled(model.currentVersion == nil || model.isBusy)
-            Button("检查 Zashboard 更新…") { model.checkForUpdates() }.disabled(model.isBusy || model.updater == nil)
+            Button("检查 Zashboard 面板更新…") {
+                navigation.selection = .updates
+                openSettings()
+                model.checkForUpdates()
+            }.disabled(model.isBusy || model.updater == nil)
+        }
+        CommandGroup(after: .help) {
+            Button("复制面板地址") {
+                guard let address = model.panelAddress else { return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(address.absoluteString, forType: .string)
+            }
+            .disabled(model.panelAddress == nil)
+            .help("远程 Mihomo 服务限制面板来源时，可将此地址提供给服务管理员。")
         }
     }
 
@@ -60,77 +84,144 @@ struct ZashDockCommands: Commands {
 struct MainWindow: View {
     @Bindable var model: AppModel
     @State private var importing = false
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
     var body: some View {
         Group {
             if model.phase == .configurationRecovery {
                 ConfigurationRecoveryView(model: model)
             } else if model.phase == .ready, let session = model.session {
-                WebView(session.page).webViewMagnificationGestures(.enabled).allowsHitTesting(!model.isBusy)
+                WebView(session.page)
+                    .webViewMagnificationGestures(.enabled)
+                    .allowsHitTesting(!model.isContentBlocked)
             } else {
                 VStack(spacing: 20) {
-                    Image(systemName: model.phase == .damaged ? "wrench.and.screwdriver" : "square.and.arrow.down").font(.system(size: 48)).foregroundStyle(.secondary)
+                    Image(systemName: stateSymbol)
+                        .font(.system(size: 48)).foregroundStyle(.secondary).accessibilityHidden(true)
                     Text(title).font(.largeTitle.bold())
-                    if model.phase != .uninstalled {
-                        Text(model.updater?.isBusy == true ? model.updater?.status ?? "" : model.status)
-                            .foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    }
                     if model.phase == .starting || model.isBusy {
-                        if let progress = model.updater?.progress {
-                            ProgressView(value: progress.fractionCompleted).frame(width: 320)
-                            Text("\(ByteCountFormatter.string(fromByteCount: progress.receivedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: progress.totalBytes, countStyle: .file))").font(.caption.monospacedDigit())
-                        } else { ProgressView() }
-                        if model.isBusy { Button("取消", role: .cancel) { model.cancel() } }
+                        PanelOperationStatus(model: model)
+                            .frame(maxWidth: 340)
                     } else {
-                        if model.phase == .unavailable {
-                            if model.session?.hasRuntimeFailure == true {
-                                Button("重新载入 Zashboard") { model.reload() }.buttonStyle(.borderedProminent)
-                            }
-                            SettingsLink { Text("在设置中检查或更改端口") }.buttonStyle(.borderedProminent)
+                        if model.phase != .uninstalled {
+                            Text(model.phase == .damaged ? "面板资源无法读取。重新安装后，已有面板数据将继续保留。" : model.status)
+                                .foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }
-                        HStack(spacing: 12) {
-                            Button("下载并安装", systemImage: "arrow.down.circle") { model.install() }
-                                .buttonStyle(.borderedProminent)
-                            Button("导入 ZIP", systemImage: "square.and.arrow.down.on.square") { importing = true }
-                                .labelStyle(.iconOnly).help("导入 ZIP…")
-                        }.controlSize(.large).disabled(!model.canManageVersions)
-                        if model.currentVersion != nil || model.phase == .unavailable { Button("重试启动") { model.retryStart() } }
+                        if model.phase == .uninstalled || model.phase == .damaged {
+                            HStack(spacing: 12) {
+                                Button(model.phase == .damaged ? "重新下载并安装" : "下载并安装", systemImage: "arrow.down.circle") { model.install() }
+                                    .buttonStyle(.borderedProminent)
+                                Button("导入 ZIP", systemImage: "square.and.arrow.down.on.square") { importing = true }
+                                    .labelStyle(.iconOnly).help("导入面板 ZIP…")
+                            }.controlSize(.large).disabled(!model.canManageVersions)
+                        } else if model.phase == .unavailable {
+                            Button(model.session?.hasRuntimeFailure == true ? "重新载入面板" : "重试打开面板") { model.retryStart() }
+                                .buttonStyle(.borderedProminent).controlSize(.large)
+                            if model.canManageVersions {
+                                DisclosureGroup("更多恢复选项") {
+                                    HStack {
+                                        Button("重新下载面板") { model.install() }
+                                        Button("导入面板 ZIP…") { importing = true }
+                                    }.padding(.top, 8)
+                                }.frame(maxWidth: 340)
+                            }
+                        }
+                        if let error = model.errorMessage, model.phase == .unavailable || model.phase == .damaged {
+                            TechnicalDetails(message: error).frame(maxWidth: 340)
+                        }
                     }
-                }.padding(40).frame(maxWidth: .infinity, maxHeight: .infinity)
+                }.frame(maxWidth: 560).padding(40).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(minWidth: 800, minHeight: 560)
-        .overlay(alignment: .top) {
+        .overlay(alignment: .bottomTrailing) {
             if model.isBusy && model.phase == .ready {
-                HStack {
-                    ProgressView().controlSize(.small)
-                    Text(model.updater?.isBusy == true ? model.updater?.status ?? model.status : model.status).font(.callout)
-                    if let progress = model.updater?.progress, model.updater?.isBusy == true {
-                        ProgressView(value: progress.fractionCompleted).frame(width: 120).accessibilityLabel("下载进度")
+                PanelOperationStatus(model: model)
+                    .padding(16).frame(width: 340)
+                    .background {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(reduceTransparency ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor)) : AnyShapeStyle(.regularMaterial))
                     }
-                    Button("取消", role: .cancel) { model.cancel() }
-                }.padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)).padding()
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(Color.primary.opacity(contrast == .increased ? 0.65 : 0.12), lineWidth: 1)
+                    }
+                    .padding(16)
             }
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.zip]) { result in
             switch result {
             case .success(let url): model.install(zip: url)
             case .failure(let error):
-                if (error as NSError).code != NSUserCancelledError { model.errorMessage = error.localizedDescription }
+                if (error as NSError).code != NSUserCancelledError {
+                    model.errorTitle = "无法选择面板安装文件"
+                    model.errorMessage = error.localizedDescription
+                }
             }
         }
-        .alert("ZashDock", isPresented: Binding(get: { model.errorMessage != nil && !model.settingsVisible }, set: { if !$0 { model.errorMessage = nil } })) {
-            Button("好") { model.errorMessage = nil }
+        .alert(model.errorTitle, isPresented: Binding(get: {
+            model.errorMessage != nil && !model.settingsVisible && model.phase != .configurationRecovery && model.phase != .unavailable && model.phase != .damaged
+        }, set: { if !$0 { model.errorMessage = nil } })) {
+            if let recoveryTitle = model.errorRecoveryTitle {
+                Button(recoveryTitle) { model.retryFailedOperation() }
+            }
+            Button("关闭", role: .cancel) { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
+    }
+    private var stateSymbol: String {
+        switch model.phase {
+        case .damaged: "wrench.and.screwdriver"
+        case .unavailable: "exclamationmark.triangle"
+        case .starting: "arrow.triangle.2.circlepath"
+        default: "square.and.arrow.down"
+        }
     }
     private var title: String {
         switch model.phase {
         case .starting: "正在启动"
-        case .uninstalled: "安装 Zashboard"
-        case .installing: "正在安装 Zashboard"
-        case .damaged: "修复 Zashboard 安装"
-        case .unavailable: model.session?.hasRuntimeFailure == true ? "Zashboard 显示已中断" : "本地服务无法启动"
+        case .uninstalled: "安装 Zashboard 面板"
+        case .installing: "正在安装 Zashboard 面板"
+        case .damaged: "修复 Zashboard 面板"
+        case .unavailable: model.session?.hasRuntimeFailure == true ? "面板显示已中断" : "暂时无法打开面板"
         case .configurationRecovery: "恢复应用设置"
-        case .ready: "Zashboard"
+        case .ready: "Zashboard 面板"
+        }
+    }
+}
+
+struct PanelOperationStatus: View {
+    let model: AppModel
+    private var status: String {
+        model.updater?.isBusy == true ? model.updater?.status ?? model.status : model.status
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                if model.updater?.progress == nil || model.updater?.isBusy != true {
+                    ProgressView().controlSize(.small).accessibilityLabel("面板操作进行中")
+                }
+                Text(status).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                if model.canCancel {
+                    Button("取消", role: .cancel) { model.cancel() }
+                }
+            }
+            if let progress = model.updater?.progress, model.updater?.isBusy == true {
+                ProgressView(value: progress.fractionCompleted).accessibilityLabel("面板下载进度")
+                Text("\(ByteCountFormatter.string(fromByteCount: progress.receivedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: progress.totalBytes, countStyle: .file))")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+struct TechnicalDetails: View {
+    let message: String
+    var body: some View {
+        DisclosureGroup("技术详情") {
+            Text(message).font(.callout).foregroundStyle(.secondary)
+                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
         }
     }
 }
@@ -138,38 +229,38 @@ struct MainWindow: View {
 struct ConfigurationRecoveryView: View {
     @Bindable var model: AppModel
     @State private var confirmingReset = false
-    @State private var originalPort = ""
-    private var preservedPort: UInt16? { model.recoverableOriginPort ?? UInt16(originalPort).flatMap { $0 >= 1024 ? $0 : nil } }
     var body: some View {
         VStack(spacing: 20) {
             Image(systemName: "externaldrive.badge.exclamationmark")
                 .font(.system(size: 48)).foregroundStyle(.secondary).accessibilityHidden(true)
             Text("恢复应用设置").font(.largeTitle.bold())
-            Text("应用设置无法读取。可以重新读取，或保留原端口后恢复窗口等应用设置。")
+            Text("应用设置无法读取。原设置文件与面板数据已保留。")
                 .multilineTextAlignment(.center)
-            Text(model.startupIssue?.localizedDescription ?? model.status)
-                .foregroundStyle(.secondary).multilineTextAlignment(.center)
             if model.isBusy { ProgressView() }
-            if let knownPort = model.recoverableOriginPort {
-                Text("已找到原端口：\(knownPort)")
+            if model.recoverableOriginPort != nil {
+                Text("已找到原有面板的连接信息，可以恢复应用设置后继续使用。")
+                    .foregroundStyle(.secondary).multilineTextAlignment(.center)
+                HStack {
+                    Button("重新读取设置") { Task { await model.retryStartup() } }
+                    Button("恢复应用设置…") { confirmingReset = true }
+                        .buttonStyle(.borderedProminent)
+                }.disabled(model.isBusy)
             } else {
-                TextField("原本地端口", text: $originalPort).frame(width: 220)
-                Text("请输入此前使用的端口，以定位原有网页数据。应用不会猜测或清除原数据。")
-                    .font(.callout).foregroundStyle(.secondary)
+                Text("暂时无法确认原有面板数据的位置。请恢复设置文件后重试。")
+                    .foregroundStyle(.secondary).multilineTextAlignment(.center)
+                Button("重新读取设置") { Task { await model.retryStartup() } }
+                    .buttonStyle(.borderedProminent).disabled(model.isBusy)
             }
-            HStack {
-                Button("重新读取配置") { Task { await model.retryStartup() } }
-                Button("保留原端口并恢复应用设置…") { confirmingReset = true }
-                    .buttonStyle(.borderedProminent).disabled(preservedPort == nil)
-            }.disabled(model.isBusy)
-            Text("WebKit 中的 Remote、网页设置和已有网页版本会被保留。")
-                .font(.callout).foregroundStyle(.secondary)
+            if let file = model.configurationFileURL {
+                Button("在 Finder 中查看设置文件") { NSWorkspace.shared.activateFileViewerSelecting([file]) }
+            }
+            TechnicalDetails(message: model.startupIssue?.localizedDescription ?? model.status)
         }.padding(40).frame(maxWidth: 620).frame(maxWidth: .infinity, maxHeight: .infinity)
-            .confirmationDialog("保留原端口并恢复应用设置？", isPresented: $confirmingReset) {
-                Button("保全原文件并恢复") { Task { await model.resetConfigurationAndRestart(preservingPort: preservedPort) } }
+            .confirmationDialog("恢复应用设置？", isPresented: $confirmingReset) {
+                Button("保留原文件并恢复") { Task { await model.resetConfigurationAndRestart(preservingPort: model.recoverableOriginPort) } }
                 Button("取消", role: .cancel) {}
             } message: {
-                Text("本地服务保留原端口 \(preservedPort.map(String.init) ?? "")，窗口行为恢复默认值。原设置文件单独保全，网页数据和已有版本保持完整。")
+                Text("窗口行为将恢复默认值。原设置文件会单独备份，已安装面板、远程服务配置和面板数据均会保留。")
             }
     }
 }
@@ -177,25 +268,55 @@ struct ConfigurationRecoveryView: View {
 struct SettingsView: View {
     @Bindable var model: AppModel
     @Bindable var wrapperUpdater: WrapperUpdateController
+    @Bindable var navigation: SettingsNavigation
     var body: some View {
-        TabView {
-            GeneralSettings(model: model).tabItem { Label("通用", systemImage: "gearshape") }
-            UpdatesSettings(model: model, wrapperUpdater: wrapperUpdater).tabItem { Label("更新", systemImage: "arrow.triangle.2.circlepath") }
-            Form {
-                AppVersions(wrapperVersion: wrapperUpdater.versionDescription, zashboardVersion: model.zashboardVersionDescription)
-                Link("ZashDock 项目", destination: WrapperUpdateController.repositoryURL)
-                Link("ZashDock 发布版本", destination: WrapperUpdateController.releasesURL)
-                Link("ZashDock MIT License", destination: WrapperUpdateController.repositoryURL.appendingPathComponent("blob/main/LICENSE"))
-                Link("Sparkle 许可", destination: URL(string: "https://github.com/sparkle-project/Sparkle/blob/2.10.0/LICENSE")!)
-                Link("Zashboard 官方项目", destination: URL(string: "https://github.com/Zephyruso/zashboard")!)
-                Link("Zashboard MIT License", destination: URL(string: "https://github.com/Zephyruso/zashboard/blob/main/LICENSE")!)
-            }.formStyle(.grouped).tabItem { Label("关于", systemImage: "info.circle") }
-        }.padding().frame(width: 640, height: 500)
+        TabView(selection: $navigation.selection) {
+            GeneralSettings(model: model)
+                .tabItem { Label("通用", systemImage: "gearshape") }.tag(SettingsTab.general)
+            UpdatesSettings(model: model, wrapperUpdater: wrapperUpdater)
+                .tabItem { Label("更新", systemImage: "arrow.triangle.2.circlepath") }.tag(SettingsTab.updates)
+            AboutSettings(wrapperUpdater: wrapperUpdater, zashboardVersion: model.zashboardVersionDescription)
+                .tabItem { Label("关于", systemImage: "info.circle") }.tag(SettingsTab.about)
+        }.padding().frame(minWidth: 560, idealWidth: 640, minHeight: 460, idealHeight: 540)
             .onAppear { model.settingsVisible = true }
             .onDisappear { model.settingsVisible = false }
-            .alert("ZashDock", isPresented: Binding(get: { model.errorMessage != nil && model.settingsVisible }, set: { if !$0 { model.errorMessage = nil } })) {
-                Button("好") { model.errorMessage = nil }
+            .alert(model.errorTitle, isPresented: Binding(get: { model.errorMessage != nil && model.settingsVisible }, set: { if !$0 { model.errorMessage = nil } })) {
+                if let recoveryTitle = model.errorRecoveryTitle {
+                    Button(recoveryTitle) { model.retryFailedOperation() }
+                }
+                Button("关闭", role: .cancel) { model.errorMessage = nil }
             } message: { Text(model.errorMessage ?? "") }
+    }
+}
+
+struct AboutSettings: View {
+    let wrapperUpdater: WrapperUpdateController
+    let zashboardVersion: String
+    var body: some View {
+        Form {
+            Section {
+                VStack(spacing: 10) {
+                    Image(nsImage: NSApplication.shared.applicationIconImage)
+                        .resizable().interpolation(.high).frame(width: 64, height: 64).accessibilityHidden(true)
+                    Text("ZashDock").font(.title2.weight(.semibold))
+                    Text("使用 Zashboard 面板连接远程 Mihomo 服务。")
+                        .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }.frame(maxWidth: .infinity).padding(.vertical, 12)
+            }
+            Section("版本") {
+                AppVersions(wrapperVersion: wrapperUpdater.versionDescription, zashboardVersion: zashboardVersion)
+            }
+            Section("项目与支持") {
+                Link("ZashDock 项目", destination: WrapperUpdateController.repositoryURL)
+                Link("ZashDock 发布版本", destination: WrapperUpdateController.releasesURL)
+                Link("Zashboard 面板项目", destination: URL(string: "https://github.com/Zephyruso/zashboard")!)
+            }
+            Section("开源许可") {
+                Link("ZashDock · MIT License", destination: WrapperUpdateController.repositoryURL.appendingPathComponent("blob/main/LICENSE"))
+                Link("Zashboard · MIT License", destination: URL(string: "https://github.com/Zephyruso/zashboard/blob/main/LICENSE")!)
+                Link("Sparkle 许可", destination: URL(string: "https://github.com/sparkle-project/Sparkle/blob/2.10.0/LICENSE")!)
+            }
+        }.formStyle(.grouped)
     }
 }
 
@@ -214,19 +335,8 @@ struct UpdatesSettings: View {
     @State private var importing = false
     var body: some View {
         Form {
-            if model.isBusy {
-                Section("操作状态") {
-                    Text(model.updater?.isBusy == true ? model.updater?.status ?? model.status : model.status)
-                    if let progress = model.updater?.progress, model.updater?.isBusy == true {
-                        ProgressView(value: progress.fractionCompleted).accessibilityLabel("下载进度")
-                    } else { ProgressView().controlSize(.small) }
-                    if model.operation != nil { Button("取消", role: .cancel) { model.cancel() } }
-                }
-            }
-            Section("版本") {
-                AppVersions(wrapperVersion: wrapperUpdater.versionDescription, zashboardVersion: model.zashboardVersionDescription)
-            }
             Section("ZashDock 应用") {
+                LabeledContent("ZashDock 版本", value: wrapperUpdater.versionDescription)
                 Button("检查 ZashDock 更新…") { wrapperUpdater.checkForUpdates() }
                     .disabled(!wrapperUpdater.canCheckForUpdates)
                 Toggle("自动检查 ZashDock 更新", isOn: Binding(
@@ -234,32 +344,36 @@ struct UpdatesSettings: View {
                     set: { wrapperUpdater.setAutomaticallyChecksForUpdates($0) }
                 )).disabled(!wrapperUpdater.hasStarted)
                 Link("查看 ZashDock 发布版本", destination: WrapperUpdateController.releasesURL)
-                Text("应用更新来自 MiracleHYH/ZashDock 的签名发布包。")
+                Text("应用更新由 ZashDock 项目提供，并通过更新签名验证。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("Zashboard 网页") {
+            Section("Zashboard 面板") {
+                LabeledContent("Zashboard 版本", value: model.zashboardVersionDescription)
                 LabeledContent("最新稳定版", value: model.updater?.latest?.tag ?? "尚未检查")
+                if !model.isBusy, let result = model.updateCheckResult {
+                    Label(result, systemImage: "info.circle")
+                        .font(.callout).fixedSize(horizontal: false, vertical: true)
+                }
                 HStack {
                     Button("检查更新") { model.checkForUpdates() }
                     if let latest = model.updater?.latest, latest.tag != model.currentVersion?.tag {
                         Button("安装 \(latest.tag)") { model.install(release: latest) }
                     }
-                    Button("导入 ZIP…") { importing = true }
-                }
-                if let updater = model.updater, !updater.status.isEmpty {
-                    Text(updater.status).font(.caption).foregroundStyle(.secondary)
-                }
+                    Button("导入面板 ZIP…") { importing = true }
+                }.disabled(model.isBusy || !model.canManageVersions)
                 if model.isBusy {
-                    if let progress = model.updater?.progress { ProgressView(value: progress.fractionCompleted) }
-                    else { ProgressView().controlSize(.small) }
+                    PanelOperationStatus(model: model)
                 }
-            }.disabled(model.isBusy || !model.canManageVersions)
+            }
         }.formStyle(.grouped)
             .fileImporter(isPresented: $importing, allowedContentTypes: [.zip]) { result in
                 switch result {
                 case .success(let url): model.install(zip: url)
                 case .failure(let error):
-                    if (error as NSError).code != NSUserCancelledError { model.errorMessage = error.localizedDescription }
+                    if (error as NSError).code != NSUserCancelledError {
+                        model.errorTitle = "无法选择面板安装文件"
+                        model.errorMessage = error.localizedDescription
+                    }
                 }
             }
     }
@@ -268,38 +382,27 @@ struct UpdatesSettings: View {
 struct GeneralSettings: View {
     @Bindable var model: AppModel
     @Environment(\.openWindow) private var openWindow
-    @State private var port = "9099"
     var body: some View {
         Form {
             if model.startupIssue != nil {
                 Section("设置需要恢复") {
-                    Text("请先恢复普通设置文件，再修改端口或窗口选项。")
+                    Text("恢复应用设置后，可以继续调整窗口行为。")
                     Button("打开恢复界面") { openWindow(id: "main") }
                 }
             }
-            Section("本地服务") {
-                HStack {
-                    TextField("端口", text: $port).frame(maxWidth: 240)
-                    Button("应用") { model.requestPort(port) }
-                        .disabled(UInt16(port).map { $0 < 1024 } ?? true)
-                }
-                LabeledContent("当前端口", value: "\(model.configuration.port)")
-                Button("自动选择并保存可用端口") { model.requestPort(nil) }
-                Text("有效范围 1024–65535。迁移验证成功后才保存；更改后请同步检查 Mihomo 的 CORS Origin 白名单。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }.disabled(model.startupIssue != nil)
-            Section("启动与窗口") {
+            Section {
                 Toggle("关闭最后一个窗口后退出", isOn: Binding(get: { model.configuration.quitAfterLastWindowCloses }, set: { model.setQuitAfterLastWindow($0) }))
-            }.disabled(model.startupIssue != nil)
+            } header: {
+                Text("窗口")
+            } footer: {
+                Text("退出 ZashDock 不影响远程 Mihomo 服务运行。")
+            }.disabled(model.startupIssue != nil || model.isBusy)
             if let backup = model.configurationRecoveryBackup {
                 Section("配置恢复备份") {
                     Button("在 Finder 中查看原配置备份") { NSWorkspace.shared.activateFileViewerSelecting([backup]) }
                 }
             }
-            if model.isBusy { ProgressView(model.status).controlSize(.small) }
         }
-        .formStyle(.grouped).disabled(model.isBusy)
-        .onAppear { port = String(model.configuration.port) }
-        .onChange(of: model.configuration.port) { _, value in port = String(value) }
+        .formStyle(.grouped)
     }
 }

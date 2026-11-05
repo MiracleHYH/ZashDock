@@ -6,14 +6,18 @@ cd "$(dirname "$0")/.."
 command -v jq > /dev/null || { printf '%s\n' 'jq is required for external primary-metadata observation.' >&2; exit 2; }
 build_root="$PWD/build/AppModelProcessHarness"
 mkdir -p "$build_root" "$PWD/build/verification"
+export CLANG_MODULE_CACHE_PATH="$build_root/ModuleCache"
+export SWIFTPM_MODULECACHE_OVERRIDE="$build_root/ModuleCache"
 report_root=$(mktemp -d "$PWD/build/verification/appmodel-processes.XXXXXX")
 app="$build_root/AppModelProcessHarness.app"
 binary="$app/Contents/MacOS/AppModelProcessHarness"
 mkdir -p "$app/Contents/MacOS"
 cp Tests/AppModelProcessHarness/Info.plist "$app/Contents/Info.plist"
 # Build Core in this harness's own scratch tree, independent of concurrent xcodebuild.
-xcrun swift build --package-path Packages/ZashDockCore --scratch-path "$build_root/Core" -c debug > "$build_root/core-build.log" 2>&1
-core_bin=$(xcrun swift build --package-path Packages/ZashDockCore --scratch-path "$build_root/Core" -c debug --show-bin-path)
+swift_build_args=(--package-path Packages/ZashDockCore --disable-sandbox --scratch-path "$build_root/Core"
+  --cache-path "$build_root/cache" --config-path "$build_root/config" --security-path "$build_root/security" -c debug)
+xcrun swift build "${swift_build_args[@]}" > "$build_root/core-build.log" 2>&1
+core_bin=$(xcrun swift build "${swift_build_args[@]}" --show-bin-path)
 core_modules="$core_bin/Modules"
 core_objects=("$core_bin"/ZashDockCore.build/*.swift.o)
 # Current SwiftPM may select the Xcode build backend and emit one merged object.
@@ -30,7 +34,8 @@ xcrun swiftc -parse-as-library -swift-version 6 -target arm64-apple-macos26.0 \
   Tests/AppModelProcessHarness/Harness.swift "${production_sources[@]}" "${core_objects[@]}" -lz -o "$binary"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
-shasum -a 256 "${production_sources[@]}" Packages/ZashDockCore/Sources/ZashDockCore/*.swift > "$report_root/source-SHA256SUMS.txt"
+shasum -a 256 "${production_sources[@]}" Packages/ZashDockCore/Sources/ZashDockCore/*.swift \
+  Tests/AppModelProcessHarness/Harness.swift Scripts/test-appmodel-processes.sh > "$report_root/source-SHA256SUMS.txt"
 fixture_root="$report_root/fixture"
 mkdir -p "$fixture_root"
 harness_pids=()
@@ -80,6 +85,8 @@ for ((attempt=0; attempt<1500; attempt++)); do
 done
 [[ -f "$fixture_root/sentinel.json" ]]
 target_port=$(jq -er .newPort "$fixture_root/fixture.json")
+jq -e '.automaticPortSelection == true' "$fixture_root/app-root/configuration.json" > /dev/null
+[[ "$target_port" -ge 49152 && "$target_port" -le 65535 ]]
 "$binary" transfer "$fixture_root" > "$fixture_root/transfer.log" 2>&1 &
 active_harness_pid=$!
 harness_pids+=("$active_harness_pid")
@@ -87,7 +94,7 @@ commit_observed=false
 for ((attempt=0; attempt<3000; attempt++)); do
   if ! kill -0 "$active_harness_pid" 2>/dev/null; then cat "$fixture_root/transfer.log" >&2; exit 1; fi
   if [[ -f "$fixture_root/transfer-started.json" ]] && \
-      jq -e --argjson port "$target_port" '.port == $port' "$fixture_root/app-root/configuration.json" > /dev/null; then
+      jq -e --argjson port "$target_port" '.port == $port and .automaticPortSelection == true' "$fixture_root/app-root/configuration.json" > /dev/null; then
     # Observe the production primary commit externally; no product callback or test hook.
     jq --argjson pid "$active_harness_pid" '{writerPID:$pid,observedConfiguration:.}' \
       "$fixture_root/app-root/configuration.json" > "$fixture_root/commit-observed.json"
@@ -115,5 +122,5 @@ jq -e '.connections == 0' "$fixture_root/sentinel-count.json" > /dev/null
 unique_pids=$(printf '%s\n' "${harness_pids[@]}" | sort -u | wc -l | tr -d ' ')
 printf '%s\n' "${harness_pids[@]}" > "$report_root/process-pids.txt"
 [[ "$unique_pids" == "${#harness_pids[@]}" ]]
-printf 'PASS: %s distinct process PIDs; production AppModel normal restart, occupied-port migration and committed-port SIGKILL restart; sentinel connections 0.\n' "$unique_pids"
+printf 'PASS: %s distinct process PIDs; production AppModel normal restart, automatic occupied-port migration and committed-port SIGKILL restart; sentinel connections 0.\n' "$unique_pids"
 printf '%s\n' 'This fixture has no App Sandbox entitlement; xcodebuild integration suites cover the sandboxed app. No OS-reboot or pre-commit crash coverage is claimed.'

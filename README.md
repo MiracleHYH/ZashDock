@@ -10,9 +10,11 @@ ZashDock 是仅面向 Apple Silicon 的 macOS 原生 Zashboard 容器：从 [Zep
 
 ## 正式版分发
 
-通过 GitHub Releases 直接分发正式版，当前发行源码对应 **`v1.0.1`**，应用内版本为 **`1.0.1 (3)`**，要求 Apple Silicon、macOS 26.0+，不需要上架 App Store。产品版本和 Apple 分发身份分别记录：使用实际 Release 构建和 **ad hoc 签名**；维护者目前没有 Apple Developer Program 会员，没有 Developer ID 签名、Apple 公证或装订。**Gatekeeper 可能阻止下载后的应用启动**；ad hoc 签名不提供 Apple 验证的开发者身份，也不能保证每台 Mac 上的首次启动体验。确认下载来源后可按 [Apple 官方说明](https://support.apple.com/zh-cn/102445)，在“系统设置 → 隐私与安全性”选择 ZashDock 的“仍要打开”。
+通过 GitHub Releases 直接分发正式版，要求 Apple Silicon、macOS 26.0+，不需要上架 App Store。当前源码版本为 **`v1.1.0` / `1.1.0 (4)`**，包含自动面板地址与原生交互优化，详情见 [v1.1.0 发行说明](Docs/RELEASE-NOTES-1.1.0.md)。实际可下载的版本以 [Releases](https://github.com/MiracleHYH/ZashDock/releases) 为准。产品版本和 Apple 分发身份分别记录：使用实际 Release 构建和 **ad hoc 签名**；维护者目前没有 Apple Developer Program 会员，没有 Developer ID 签名、Apple 公证或装订。**Gatekeeper 可能阻止下载后的应用启动**；ad hoc 签名不提供 Apple 验证的开发者身份，也不能保证每台 Mac 上的首次启动体验。确认下载来源后可按 [Apple 官方说明](https://support.apple.com/zh-cn/102445)，在“系统设置 → 隐私与安全性”选择 ZashDock 的“仍要打开”。
 
 稳定 Sparkle Feed 的更新包与 Feed 均使用专用 Ed25519 密钥签名；该更新完整性验证独立于 Apple 的 Developer ID 和公证。发行同时提供应用 ZIP、SHA-256、匹配 dSYM 与白名单构建信息；归档检查和对应源码提交的 CI 通过后才发布。v1.0.1 修复同端口更新被 GeoIP 数据库拦截的问题；范围与验证边界见 [v1.0.1 发行说明](https://github.com/MiracleHYH/ZashDock/blob/main/Docs/RELEASE-NOTES-1.0.1.md)。实际可用版本以仓库 [Releases](https://github.com/MiracleHYH/ZashDock/releases) 为准。
+
+v1.1.0 已有 Core 83 项 / 6 suites、实际 Xcode 沙箱 App 69 项通过 / 3 项跳过、正式 AppModel 跨进程 7 个 PID 和隔离原生 UI 的本地验证记录。对应源码的 CI、签名发布与资产检查由发布工作流执行；真实 Sparkle 安装替换全过程仍未单独验收。具体范围见 [测试说明](Docs/TESTING.md)。
 
 ## 构建与运行
 
@@ -73,38 +75,40 @@ xcodebuild -project ZashDock.xcodeproj \
 
 GitHub 匿名 API 的额度按网络出口共享，使用同一代理出口的其他请求也会占用额度。出现限流时，应用显示 HTTP 状态及响应中可用的重试时间；可以等待后重试，或使用右侧图标导入本地 ZIP。
 
-## 连接 Remote 与端口设置
+## 连接远程服务与自动面板地址
 
 原版 Zashboard 负责 Remote 的添加、编辑、切换、节点管理和统计。ZashDock 不另做一套 Remote 编辑器，也不在本地提供转发远程请求的代理 API。
 
-本地服务默认端口为 **9099**。在原生 **设置 → 通用** 中可以指定 **1024–65535**，或主动点击“自动选择并保存可用端口”。自动选择只在用户显式触发后进行，当前探测范围为 9099–9198；应用不会在启动失败时静默修改端口。
+本地面板地址由应用自动管理，不提供端口设置。首次使用或从旧配置升级时，应用在 **49152–65535** 中随机尝试高位端口，实际绑定并验证成功后才保存。以后启动复用已保存地址；端口被其他程序占用时，应用自动选择其他可用高位端口，并安全转移已有网页数据。不会在每次启动时重新随机地址。
 
 端口切换执行“暂停网页并停止旧服务 → 一次性读取当前 WebKit 数据到内存 → 实际绑定新端口 → 在网页初始化前写入并核验数据 → 验证真实网页 → 原子保存端口 → 清理旧 Origin”。始终只运行一个 HTTP 监听器；提交前失败会保留原端口和原数据，并尝试重新启动旧服务。旧端口在启动前已被占用时，仍可通过可信模拟文档直接读取该 Origin 的 WebKit 存储，不会请求占用端口的程序。
 
-远程 Mihomo 需要允许实际面板 Origin。使用精确白名单时，可按远端版本配置：
+远程 Mihomo 需要允许实际面板 Origin。可从系统菜单 **帮助 → 复制面板地址** 获取当前地址，用于远程服务的 CORS 白名单诊断；这不是端口设置入口。使用精确白名单时，按远端版本配置，并把下方示例地址替换成实际复制的地址：
 
 ```yaml
 external-controller-cors:
   allow-origins:
-    - 'http://127.0.0.1:9099'
+    - 'http://127.0.0.1:54321' # 示例；替换为“复制面板地址”得到的实际地址
   allow-private-network: true
 ```
 
-修改本地端口后，须相应检查远端白名单。具体配置见 [Mihomo 官方文档](https://github.com/MetaCubeX/Meta-Docs/blob/main/docs/config/general.en.md#external-control-api)。应用不会替用户修改远端、Surge 或系统代理配置；LAN/VPN 连通性还取决于实际路由、权限和防火墙。HTTP Remote 支持明文连接，凭据保护需要后端提供 HTTPS；浏览器 CORS 仍然生效。
+首次迁移或端口冲突导致面板地址改变后，使用精确白名单的远程服务可能需要允许新地址。具体配置见 [Mihomo 官方文档](https://github.com/MetaCubeX/Meta-Docs/blob/main/docs/config/general.en.md#external-control-api)。应用不会替用户修改远端、Surge 或系统代理配置；LAN/VPN 连通性还取决于实际路由、权限和防火墙。HTTP Remote 支持明文连接，凭据保护需要后端提供 HTTPS；浏览器 CORS 仍然生效。
 
 ## 网页数据持久化
 
 日常配置只保存在固定的持久 `WKWebsiteDataStore.default()` 中，由原版 Zashboard 正常读写 LocalStorage 和 IndexedDB。普通重载、退出和重启不导出配置、不重新注入旧值，也不增加原生 Remote 文件、定时同步或 Keychain 密钥。用户主动清空网页设置后，应用不会回放旧配置。
 
-改端口时，`OriginStorageTransfer` 一次性转移完整 LocalStorage，以及已核验的官方 `base64`、`connection-history` 两个 IndexedDB，包含 Remote、选中后端、设置、本地背景图和连接历史。数据只暂存在内存；目标数据在官方网页初始化前已写入。未知数据库或结构、超限、取消和验证失败都会中止提交并保留源数据。这里的“完整”指当前官方版本的业务数据，不包含 Cookie、sessionStorage、Service Worker 和可重新生成的缓存。
+自动更换地址时，`OriginStorageTransfer` 一次性转移完整 LocalStorage，以及已核验的官方 `base64`、`connection-history` 两个 IndexedDB，包含 Remote、选中后端、设置、本地背景图和连接历史。数据只暂存在内存；目标数据在官方网页初始化前已写入。已知 `zashboard-geoip` v2 和 `zashboard-earth-geoip` v1 可再生缓存不迁移、不删除源缓存，新地址由上游按需重新生成；其他未知数据库或结构、超限、取消和验证失败都会中止提交并保留源数据。这里的“完整”指受支持的业务数据，不包含 Cookie、sessionStorage、Service Worker 和可重新生成的缓存。
 
-原生设置文件只记录端口、窗口行为及兼容和清理标记。端口提交成功后才清理旧 Origin；若中断，重启会根据已提交端口继续工作并重试旧数据清理。普通设置损坏时先保全原文件，再显式恢复原端口，避免误把其他 Origin 当成空配置。
+原生设置文件只记录已选端口、自动管理标记、窗口行为及兼容和清理标记。端口提交成功后才清理旧 Origin；若中断，重启会根据已提交端口继续工作并重试旧数据清理。普通设置损坏时先保全原文件，再使用可确认的恢复元数据定位原网页数据；无法确认原 Origin 时停止恢复并保留数据，不猜测新地址，也不要求用户填写端口。
 
 从早期开发版升级时，`LegacyWebStorageReader` 可只读认证原密文并完成一次导入。成功标记后不再读取旧密文或访问其 Keychain 项；原文件不会被修改或删除。旧密钥暂不可读时保留文件并允许重试，不生成替代密钥。全新安装不使用此兼容路径。Bundle ID 固定为 `app.zashdock.mac`，请保持应用身份稳定。
 
 ## 更新与当前安装
 
 从系统菜单栏 **ZashDock → 设置…** 或 **⌘,** 打开原生设置窗口。主窗口不放右上角设置或版本控件。**设置 → 更新** 和 **关于** 页均同时显示明确标注的 ZashDock 完整版本（含构建号）与 Zashboard 版本；系统菜单 **关于 ZashDock** 的原生面板也同时显示两者。更新页另提供 Zashboard 最新稳定版和安装入口。
+
+系统菜单的“检查 Zashboard 更新…”直接打开更新页，使检查、结果和安装操作位于同一处。后台检查和下载期间面板仍可操作；切换版本或迁移数据时才短暂暂停。每项任务使用单一进度与有效的取消入口，错误反馈说明任务结果并指向恢复动作；故障页面按当前问题突出一个首选操作。
 
 应用只保留当前安装，不提供 Zashboard 回滚、历史下载列表或历史保留数。候选先使用全新空的临时 WebKit 存储验证实际网页及本地服务版本，通过后才提交当前指针，再以原端口加载原持久 profile。同端口更新不读取或复制用户存储，不受端口迁移器支持的数据库格式限制，GeoIP 等额外 IndexedDB 原地保留。候选失败或取消时原安装和网页数据保留；成功加载后清理旧资源。旧版已有历史目录在当前安装确认可用后清理，用户的 Remote、设置及背景/历史数据库独立保留。
 
@@ -120,7 +124,7 @@ ZashDock 使用 MIT License；App 资源内保留本项目及 Sparkle 的完整�
 
 应用固定使用 `main/appcast.xml` 的 HTTPS 更新源，并要求更新源及更新包的 Ed25519 签名有效。公钥随应用发布，专用私钥不提交源码；签名失败不会在一段时间后自动回退为无签名 Feed。`v1.0.0` 已于 2026-10-23 进入稳定 Feed；后续发行沿用相同更新身份。
 
-推送和 Pull Request 只触发构建、测试和 Debug 工件上传。正式发布须手动运行 `Publish signed ZashDock` 工作流并输入 `PUBLISH`，通过 `signing_mode` 显式选择 Apple 分发模式：默认 `developer-id` 要求 Developer ID 签名、公证和装订；本次选择 `adhoc`，明确保留未公证限制。两种模式均要求 Sparkle 对更新包和 Feed 签名并独立验证，成功后才创建正式 GitHub Release 并更新 Feed；缺少所选模式的必需凭据时停止，不隐式切换模式。v1.0.1 使用 Build `3`，供 v1.0.0 Build `2` 的安装识别更新；后续发行 Build 必须继续递增。所需配置和失败恢复步骤见 [发布说明](Docs/RELEASING.md)。
+推送和 Pull Request 只触发构建、测试和 Debug 工件上传。正式发布须手动运行 `Publish signed ZashDock` 工作流并输入 `PUBLISH`，通过 `signing_mode` 显式选择 Apple 分发模式：默认 `developer-id` 要求 Developer ID 签名、公证和装订；本次准备继续选择 `adhoc`，明确保留未公证限制。两种模式均要求 Sparkle 对更新包和 Feed 签名并独立验证，成功后才创建正式 GitHub Release 并更新 Feed；缺少所选模式的必需凭据时停止，不隐式切换模式。v1.0.1 使用 Build `3`，本次 v1.1.0 准备使用 Build `4` 供已有安装识别更新；发布前仍须确认远端版本和 Build 未被占用，后续发行持续递增。所需配置和失败恢复步骤见 [发布说明](Docs/RELEASING.md)。
 
 ## 进一步阅读
 

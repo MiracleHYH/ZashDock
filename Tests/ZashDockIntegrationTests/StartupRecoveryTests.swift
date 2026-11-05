@@ -14,6 +14,7 @@ struct StartupRecoveryTests {
         defer { try? FileManager.default.removeItem(at: paths.root) }
         let reservation = try await bindFixture(paths.root)
         var configuration = AppConfiguration(); configuration.port = reservation.port
+        configuration.automaticPortSelection = true
         reservation.stop(); try ConfigurationStore(url: paths.configuration).save(configuration)
         try await body(paths, .nonPersistent(), configuration.port)
     }
@@ -35,6 +36,7 @@ struct StartupRecoveryTests {
             await model.retryStartup()
             #expect(model.phase == .configurationRecovery)
             var repaired = AppConfiguration(); repaired.port = port
+            repaired.automaticPortSelection = true
             try ConfigurationStore(url: paths.configuration).save(repaired)
             await model.retryStartup()
             #expect(model.phase == .uninstalled)
@@ -88,7 +90,7 @@ struct StartupRecoveryTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
-    func unknownOriginalPortRequiresExplicitInputInsteadOfSilentlySelecting9099() async throws {
+    func unknownOriginalOriginStopsRecoveryWithoutReplacingMetadataOrWebsiteData() async throws {
         try await withPaths { paths, dataStore, oldPort in
             let configurationStore = ConfigurationStore(url: paths.configuration)
             try FileManager.default.removeItem(at: configurationStore.recoveryCopyURL)
@@ -101,9 +103,9 @@ struct StartupRecoveryTests {
             await model.resetConfigurationAndRestart()
             #expect(model.phase == .configurationRecovery)
             #expect(try Data(contentsOf: paths.configuration) == broken)
-            await model.resetConfigurationAndRestart(preservingPort: oldPort)
-            #expect(model.phase == .uninstalled)
-            #expect(model.configuration.port == oldPort)
+            #expect(model.recoverableOriginPort == nil)
+            #expect(model.session == nil && model.server == nil)
+            #expect(model.configurationRecoveryBackup == nil)
             #expect(try await transfer.read(origin: fixtureOrigin(oldPort)) == original)
         }
     }

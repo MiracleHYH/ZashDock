@@ -53,8 +53,9 @@ private final class BootstrapNavigationPolicy: WebPage.NavigationDeciding {
 }
 
 /// Performs one bounded transfer using a trusted, empty simulated document at the exact Origin.
-/// Only the two official v3.29.1 business databases are supported. Source data is never changed
-/// by read/restore/verify. The caller invokes clear only after a verified configuration commit.
+/// Transfers only the two official business databases. The verified v3.30.0 GeoIP caches
+/// are reproducible downloads and remain untouched at their original Origin.
+/// Source data is never changed by read/restore/verify. Clear follows a verified configuration commit.
 @MainActor
 final class OriginStorageTransfer {
     struct Limits: Equatable, Sendable {
@@ -234,6 +235,9 @@ final class OriginStorageTransfer {
         """
     private static let script = #"""
         const names = ['base64', 'connection-history'];
+        // Official v3.30.0: geoip-chunk-store.ts and earth/geoip.worker.ts.
+        // Inspect only cache names/versions; never open, copy or clear their binary records.
+        const cacheVersions = new Map([['zashboard-geoip', 2], ['zashboard-earth-geoip', 1]]);
         const payload = payloadJSON === null ? null : JSON.parse(payloadJSON);
         const connections = new Set(), transactions = new Set();
         let stopped = false, deadline;
@@ -298,8 +302,8 @@ final class OriginStorageTransfer {
           check();
           if (typeof indexedDB.databases !== 'function') throw failure('schema');
           const all = await indexedDB.databases(); check();
-          if (all.some(item => !names.includes(item.name) || item.version !== 1)) throw failure('schema');
-          return new Set(all.map(item => item.name));
+          if (all.some(item => names.includes(item.name) ? item.version !== 1 : !cacheVersions.has(item.name) || cacheVersions.get(item.name) !== item.version)) throw failure('schema');
+          return new Set(all.filter(item => names.includes(item.name)).map(item => item.name));
         };
         const open = (name, create) => new Promise((resolve, reject) => {
           check();

@@ -21,7 +21,7 @@ import Testing
     let configuration = AppConfiguration()
     let bytes = try JSONEncoder().encode(configuration)
     let fields = try #require(try JSONSerialization.jsonObject(with: bytes) as? [String: Any])
-    #expect(Set(fields.keys) == ["port", "quitAfterLastWindowCloses", "legacyStorageImported"])
+    #expect(Set(fields.keys) == ["port", "automaticPortSelection", "quitAfterLastWindowCloses", "legacyStorageImported"])
     #expect(try JSONDecoder().decode(AppConfiguration.self, from: bytes) == configuration)
 
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

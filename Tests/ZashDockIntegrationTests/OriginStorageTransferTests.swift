@@ -92,6 +92,129 @@ struct OriginStorageTransferTests {
         """#, arguments: ["snapshotJSON": String(decoding: try JSONEncoder().encode(value), as: UTF8.self)])
     }
 
+    private func seedGeoIPCaches(page: WebPage, geoIPVersion: Int = 2, earthVersion: Int = 1) async throws {
+        try await page.callJavaScript(#"""
+        for (const [name,version] of [['zashboard-geoip',geoIPVersion],['zashboard-earth-geoip',earthVersion]]) {
+          const db = await new Promise((resolve,reject) => {
+            const request=indexedDB.open(name,version);
+            request.onupgradeneeded=()=>{
+              if(name==='zashboard-geoip') {
+                request.result.createObjectStore('manifests');request.result.createObjectStore('chunks');
+              } else request.result.createObjectStore('city-database');
+            };
+            request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(new Error('GeoIP fixture open '+name+': '+request.error?.name));
+          });
+          await new Promise((resolve,reject)=>{
+            const transaction=db.transaction([...db.objectStoreNames],'readwrite');
+            const bytes=new Uint8Array([0,17,128,254,255]);
+            if(name==='zashboard-geoip') {
+              transaction.objectStore('manifests').put({chunkCount:1,chunkSize:262144,generation:'fixture',size:bytes.length,updatedAt:12345},'https://fixture.example/country.mmdb');
+              transaction.objectStore('chunks').put(bytes.buffer,['https://fixture.example/country.mmdb','fixture',0]);
+            } else transaction.objectStore('city-database').put({blob:new Blob([bytes],{type:'application/octet-stream'}),storedAt:67890},'city');
+            transaction.oncomplete=resolve;transaction.onabort=transaction.onerror=event=>reject(new Error('GeoIP fixture write '+name+': '+(event.target.error?.name||transaction.error?.name||event.type)));
+          });db.close();
+        }return true;
+        """#, arguments: ["geoIPVersion": geoIPVersion, "earthVersion": earthVersion])
+    }
+
+    private func withPersistentCacheStore(_ body: (WKWebsiteDataStore) async throws -> Void) async throws {
+        // GeoIP includes disk-backed Blob records. Use the same persistence mode as the app,
+        // with an isolated identifier so no production profile can be read or cleared.
+        let identifier = UUID()
+        let store = WKWebsiteDataStore(forIdentifier: identifier)
+        do {
+            try await body(store)
+        } catch {
+            await store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+            try? await WKWebsiteDataStore.remove(forIdentifier: identifier)
+            throw error
+        }
+        await store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+        try? await WKWebsiteDataStore.remove(forIdentifier: identifier)
+    }
+
+    private func geoIPCacheSnapshot(page: WebPage) async throws -> String {
+        try #require(try await page.callJavaScript(#"""
+        const normalize=async value=>{
+          if(value instanceof ArrayBuffer)return {type:'ArrayBuffer',bytes:[...new Uint8Array(value)]};
+          if(value instanceof Blob)return {type:'Blob',mime:value.type,bytes:[...new Uint8Array(await value.arrayBuffer())]};
+          if(value&&typeof value==='object') {
+            const result={};for(const key of Object.keys(value))result[key]=await normalize(value[key]);return result;
+          }return value;
+        };
+        const result=[];
+        for(const name of ['zashboard-geoip','zashboard-earth-geoip']) {
+          const metadata=(await indexedDB.databases()).find(item=>item.name===name);
+          if(!metadata)continue;
+          const db=await new Promise((resolve,reject)=>{const request=indexedDB.open(name);request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);});
+          const stores=[];
+          for(const storeName of [...db.objectStoreNames]) {
+            const [keys,values]=await new Promise((resolve,reject)=>{
+              const transaction=db.transaction(storeName,'readonly'),store=transaction.objectStore(storeName);
+              const keys=store.getAllKeys(),values=store.getAll();
+              transaction.oncomplete=()=>resolve([keys.result,values.result]);transaction.onabort=transaction.onerror=()=>reject(transaction.error);
+            });
+            stores.push([storeName,keys,await Promise.all(values.map(normalize))]);
+          }db.close();result.push({name,version:metadata.version,stores});
+        }return JSON.stringify(result);
+        """#) as? String)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func verifiedGeoIPCachesStayAtSourceWhileBusinessDataMigratesAndClears() async throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await bindFixture(root); defer { source.stop() }
+        let target = try await bindFixture(root); defer { target.stop() }
+        try await withPersistentCacheStore { store in
+            let sourcePage = page(store: store); defer { sourcePage.stopLoading() }
+            let targetPage = page(store: store); defer { targetPage.stopLoading() }
+            try await load(sourcePage, source.baseURL)
+            try await seed(fixture, page: sourcePage)
+            try await seedGeoIPCaches(page: sourcePage)
+            let caches = try await geoIPCacheSnapshot(page: sourcePage)
+            #expect(caches.contains("ArrayBuffer") && caches.contains("Blob"))
+            let transfer = OriginStorageTransfer(dataStore: store)
+            let captured = try await transfer.read(origin: source.baseURL)
+            #expect(captured == fixture)
+            try await transfer.restore(captured, to: target.baseURL)
+            try await transfer.verify(captured, at: source.baseURL)
+            try await transfer.verify(captured, at: target.baseURL)
+            try await load(targetPage, target.baseURL)
+            #expect(try await geoIPCacheSnapshot(page: targetPage) == "[]")
+            try await transfer.clear(origin: source.baseURL)
+            #expect(try await transfer.read(origin: source.baseURL) == OriginStoragePayload(localStorage: [:]))
+            #expect(try await geoIPCacheSnapshot(page: sourcePage) == caches)
+            try await transfer.verify(captured, at: target.baseURL)
+
+            // An existing target cache is also outside the business payload and survives replacement.
+            try await seedGeoIPCaches(page: targetPage)
+            let targetCaches = try await geoIPCacheSnapshot(page: targetPage)
+            try await transfer.restore(captured, to: target.baseURL)
+            try await transfer.verify(captured, at: target.baseURL)
+            #expect(try await geoIPCacheSnapshot(page: targetPage) == targetCaches)
+        }
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: [(1, 1), (3, 1), (2, 2)])
+    func unverifiedGeoIPVersionsRejectBeforeChangingBusinessOrCache(versions: (Int, Int)) async throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let server = try await bindFixture(root); defer { server.stop() }
+        try await withPersistentCacheStore { store in
+            let page = page(store: store); defer { page.stopLoading() }
+            try await load(page, server.baseURL)
+            try await seed(fixture, page: page)
+            try await seedGeoIPCaches(page: page, geoIPVersion: versions.0, earthVersion: versions.1)
+            let caches = try await geoIPCacheSnapshot(page: page)
+            let transfer = OriginStorageTransfer(dataStore: store)
+            await #expect(throws: OriginStorageTransferError.unsupportedSchema) { try await transfer.read(origin: server.baseURL) }
+            await #expect(throws: OriginStorageTransferError.unsupportedSchema) { try await transfer.restore(OriginStoragePayload(localStorage: [:]), to: server.baseURL) }
+            await #expect(throws: OriginStorageTransferError.unsupportedSchema) { try await transfer.verify(fixture, at: server.baseURL) }
+            await #expect(throws: OriginStorageTransferError.unsupportedSchema) { try await transfer.clear(origin: server.baseURL) }
+            #expect(try await page.callJavaScript("return localStorage.getItem('setup/api-list');") as? String == fixture.localStorage["setup/api-list"])
+            #expect(try await geoIPCacheSnapshot(page: page) == caches)
+        }
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func absentDatabasesRemainAbsentAndNonPersistentRoundTripReplacesTarget() async throws {
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }

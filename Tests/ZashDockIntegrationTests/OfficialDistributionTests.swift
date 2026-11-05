@@ -30,6 +30,7 @@ struct OfficialDistributionTests {
             fixture.reservations.append(reservation)
             var configuration = AppConfiguration()
             configuration.port = reservation.port
+            configuration.automaticPortSelection = true
             try ConfigurationStore(url: fixture.paths.configuration).save(configuration)
             // Clear only this reserved test Origin without loading any old webpage or seeding the
             // persistent profile before exercising the first real installation.
@@ -136,6 +137,7 @@ struct OfficialDistributionTests {
             fixture.reservations.append(reservation)
             var configuration = AppConfiguration()
             configuration.port = reservation.port
+            configuration.automaticPortSelection = true
             try ConfigurationStore(url: fixture.paths.configuration).save(configuration)
 
             let firstMihomo = try await MockMihomoServer.bind(allowing: reservation.baseURL, excluding: reservation.port)

@@ -2,13 +2,21 @@
 
 ZashDock 原生应用的源码、发布包和应用更新均使用 [MiracleHYH/ZashDock](https://github.com/MiracleHYH/ZashDock)。Zashboard 网页资源仍通过 Zephyruso/zashboard 官方 Releases 独立安装和更新；二者的版本、下载来源及保留规则互不混用。
 
-首次源码推送阶段仅提交了源码和配置，没有创建 Release 或发行标签。仓库中的初始 `appcast.xml` 是已签名的空 Feed；它不代表存在可下载的正式版本。应用的 Sparkle Feed 固定为：
+首次源码推送时的 `appcast.xml` 是已签名的空 Feed；后续正式发行已使用同一更新身份。应用的 Sparkle Feed 固定为：
 
 ```text
 https://raw.githubusercontent.com/MiracleHYH/ZashDock/main/appcast.xml
 ```
 
-## v1.0.1 修复发行
+## v1.1.0 发行准备
+
+2026-11-05 用户已明确允许发布，计划版本为 **`v1.1.0` / `1.1.0 (4)`**，沿用已授权的 `adhoc` 模式。发行说明使用 [RELEASE-NOTES-1.1.0.md](RELEASE-NOTES-1.1.0.md)，覆盖自动高位端口、旧配置一次迁移、端口冲突自动恢复、精确 CORS 白名单影响，以及后台更新和原生反馈优化。保持 Bundle ID、Sparkle 公钥、Feed、App Sandbox 和 Hardened Runtime；ad hoc 模式临时加入加载 Sparkle 所需的库验证例外，不提供 Developer ID 身份、公证或装订。
+
+本次源码的本地验证为 Core 83 项 / 6 suites（1 项可选在线下载按条件跳过）、实际 Xcode 沙箱 App 69 项通过 / 3 项跳过、正式 AppModel 跨进程 7 个 PID 和隔离原生 UI 验收，详见 [TESTING.md](TESTING.md) 与 [UI-VERIFICATION.md](UI-VERIFICATION.md)。最新源码已另行构建并安装到本机供试用，仍显示 `1.0.1 (3)`；该试用构建不代替 `1.1.0 (4)` 的正式归档、签名和源码追溯检查，也不代表真实 Sparkle 安装替换全过程已经验收。
+
+以上是发行准备记录。发布前须核对远端标签、草稿、公开 Release 和稳定 Feed，确认 `v1.1.0` 未被占用且 Build `4` 大于现有条目，禁止覆盖已有版本。对应源码 CI 成功后才手动触发签名发布；归档、公开资产、Feed 提交和最终线上结果以实际工作流及 GitHub 为准。不得手工修改已经签名的 `appcast.xml`。
+
+## v1.0.1 修复发行（历史记录）
 
 2026-11-02 用户已明确批准发布 `v1.0.1`（`1.0.1 (3)`），继续采用已授权的 `adhoc` 模式。发行说明使用 [RELEASE-NOTES-1.0.1.md](RELEASE-NOTES-1.0.1.md)。保持原 Bundle ID、Sparkle 公钥、Feed、沙盒与发布权限；只有产品版本和构建号递增。对应源码 CI 成功后才手动触发发布；公开资产与 Feed 的实际状态以 GitHub 为准。
 
@@ -69,8 +77,8 @@ Sparkle 公钥仅保存在应用 `Info.plist` 的 `SUPublicEDKey`，不再维护
 
 | 输入 | 示例与规则 |
 | --- | --- |
-| `version` | `1.0.0`，不含 `v`；仅接受三段稳定版版本号 |
-| `build_number` | 首个正式版为 `2`；1–999999999 的纯正整数，必须大于已有 Feed 中所有 Build，后续发行大于 `2` |
+| `version` | 本次准备 `1.1.0`，不含 `v`；仅接受三段稳定版版本号 |
+| `build_number` | 本次准备 `4`；1–999999999 的纯正整数，必须大于已有 Feed 中所有 Build，已发行 Build 不可复用 |
 | `signing_mode` | 默认 `developer-id`；本次显式选择 `adhoc`。两种模式都进行 Sparkle 包和 Feed 签名 |
 | `confirm` | 精确输入 `PUBLISH`；其他值不会进入发布 Job |
 

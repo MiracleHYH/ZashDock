@@ -207,6 +207,7 @@ struct VersionLifecycleTests {
       let listener = try await bindFixture(current.directoryURL)
       var configuration = AppConfiguration()
       configuration.port = listener.port
+      configuration.automaticPortSelection = true
       listener.stop()
       try ConfigurationStore(url: paths.configuration).save(configuration)
       return PortMigrationFixture(paths: paths, webRoot: current.directoryURL)
@@ -260,6 +261,7 @@ struct VersionLifecycleTests {
     try Data("<div id='app'>Port reservation</div>".utf8).write(to: probe.appendingPathComponent("index.html"))
     let reservation = try await bindFixture(probe)
     var configuration = AppConfiguration(); configuration.port = reservation.port
+    configuration.automaticPortSelection = true
     reservation.stop(); try ConfigurationStore(url: paths.configuration).save(configuration)
     let fixture = PortMigrationFixture(paths: paths, webRoot: probe)
     do {
@@ -402,6 +404,7 @@ struct VersionLifecycleTests {
       let pointer = fixture.paths.root.appendingPathComponent("versions-state.json")
       let originalPointer = try Data(contentsOf: pointer)
       model.install(zip: try localArchive(fixture.paths, marker: "cancelled-candidate", rendered: false))
+      #expect(model.phase == .ready && !model.isContentBlocked && model.canCancel)
       let operation = try #require(model.operation)
       try await Task.sleep(for: .seconds(2))
       #expect(model.isBusy)

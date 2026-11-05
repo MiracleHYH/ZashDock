@@ -1,5 +1,31 @@
 # 实际构建与测试记录
 
+## 自动面板地址与原生交互优化（2026-11-05）
+
+运行环境：Apple Silicon arm64、macOS 27.0.1、Xcode 27.2（27B52）、macOS 27.2 SDK；最低部署版本保持 macOS 26.0。本次隐藏端口设置，首次或旧配置升级时自动选择 49152–65535 的可用地址，记住地址并在占用时安全迁移。后台检查/准备安装不阻塞面板，新增任务结果、就地重试和导出拒绝反馈。
+
+| 验证 | 实际结果 | 证据 |
+| --- | --- | --- |
+| Core | 汇总 83 项 / 6 suites，通过；1 项可选官方在线下载按条件跳过 | 本轮工具执行回显，4.533 秒，未保存独立日志 |
+| SwiftPM 集成测试 | 汇总 72 项 / 16 suites 通过；实际 App 宿主安全测试、两项真实官方 ZIP 和可选个人后端测试按条件跳过 | `build/design-review/integration-final.log` |
+| 最终实际 Xcode 沙箱 App | **69 项通过、3 项按条件跳过、0 失败**；汇总 72 项 / 16 suites，32.490 秒；动态参数展开后 77 个通过的 test runs | `build/design-review/native-final.xcresult`、`native-final.log`、`native-final-summary.json` |
+| 最终源码跨进程恢复 | 7 个独立 PID 通过；旧地址被占时自动迁移、外部观测真实配置提交后 SIGKILL、两次冷启动及旧业务数据清理，sentinel 连接数为 0 | `build/design-review/appmodel-processes-final.log`、`build/verification/appmodel-processes.8Kxzhz/` |
+| 发行前独立存储进程 | 19 个独立 PID 通过；持久化、提交前/提交后 SIGKILL 与旧地址 0 次连接 | `build/release-1.1.0/storage-processes.log`、`build/verification/storage-processes.fMRVLT/` |
+| 发布配置检查 | 14 项通过，覆盖模式显式选择、凭据隔离、非法输入和本地发布拒绝 | `build/release-1.1.0/release-profiles.log` |
+| 原生 UI | CUA 检查首次页、无端口通用页、更新与关于分组、单一故障主动作、未知 Origin 恢复、菜单直达更新及 HTTP 403 后重试反馈 | 直接复用生产视图的隔离评审 App；过程见 [UI-VERIFICATION.md](UI-VERIFICATION.md) |
+
+新增回归覆盖首次高位地址持久化与重启复用、旧配置首读前迁移、被占端口自动重选且不请求占用者、自动候选跳过已有业务数据、候选耗尽保留源文件/数据、安装前地址被占及损坏安装修复。已知 GeoIP v2 / 旧 earth v1 缓存只放行名称和版本，不打开、复制或清理；真实 ArrayBuffer/Blob 源缓存保留测试通过，同名未知版本仍拒绝迁移。导出失败提示仍受可信主框架、真实点击和单次授权约束，不可信或后台请求不能弹窗。
+
+首轮 SwiftPM 受限执行中 WebKit 子进程被工具沙箱拒绝，随后在获准的工具沙箱外复测。新增 GeoIP 测试最初在 nonPersistent profile 写入 Blob 失败，改为隔离 UUID 持久 profile 后通过，成功/异常均清理测试 profile；失败日志保留在 `build/design-review/integration.log`，不将夹具失败归为生产数据损坏。
+
+Xcode 已验证实际 App Sandbox 和更新权限配置；本轮未提供真实官方 ZIP，因此该两项及个人后端网络测试仍跳过。没有改动已安装正式 App 或生产网页数据，也没有发布新版本。深色/高对比外观、真实下载期间的人工操作和 macOS 26 实机仍未验收。
+
+最终 `codesign --verify --deep --strict` 与 `git diff --check` 通过。三个开发/评审 App 已按项目脚本压缩并解压逐项比对后移除可运行副本，归档位于 `build/DevelopmentAppArchives/batch.LXOs7pp8/`；日志 `build/design-review/archive-apps.log`。源码、测试归档、日志与正式安装保持可用。
+
+随后按用户要求构建相同源码的本机 ad hoc Release 试用包，沿用已有安装的 Bundle ID、版本 `1.0.1 (3)` 和权限。旧应用先 ZIP 备份、解压比对，再通过同卷暂存替换 `/Applications/ZashDock.app`，签名和 127 项文件树比较通过；证据为 `build/local-trial/build.log`、`install.log`。首次启动已自动迁移到高位地址，主窗口曾短暂显示空白；正常退出后冷启动，CUA 确认原有面板及四组代理内容正常加载、通用设置无端口项。没有据此认定空白原因或声称长期运行已验收。构建目录重复 App 已验证归档，正式安装留供试用。
+
+用户之后明确授权发布。工程准备递增为 `1.1.0 (4)`；新发行对应提交的 GitHub CI、Release 构建和签名结果仍须以实际运行核验，不用上述试用包或旧版 Feed 代替。
+
 ## 同端口更新与 GeoIP 缓存兼容修复（2026-11-02）
 
 运行环境：Apple Silicon arm64、macOS 27.0.1、Xcode 27.2（27B52）、macOS 27.2 SDK；最低部署版本仍为 macOS 26.0，本轮没有增加最低系统版本实机验收。

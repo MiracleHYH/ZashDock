@@ -46,8 +46,8 @@ final class PortMigrationFixture {
     profileIdentifier = UUID()
     dataStore = WKWebsiteDataStore(forIdentifier: profileIdentifier)
   }
-  func model() -> AppModel {
-    let model = AppModel(paths: paths, dataStore: dataStore)
+  func model(portCandidates: @escaping @Sendable (Set<UInt16>) -> [UInt16] = { AutomaticPortPolicy.candidates(excluding: $0) }) -> AppModel {
+    let model = AppModel(paths: paths, dataStore: dataStore, portCandidates: portCandidates)
     models.append(model)
     return model
   }
@@ -59,6 +59,14 @@ final class PortMigrationFixture {
       if !excluding.contains(port) { return port }
     }
     throw ZashDockError.server("端口迁移测试无法预留随机端口。")
+  }
+  func availableHighPort(excluding: Set<UInt16> = []) async throws -> UInt16 {
+    for port in AutomaticPortPolicy.candidates(excluding: excluding, limit: 30) {
+      let server = try LoopbackHTTPServer(root: webRoot, port: port, versionID: "high-port-fixture")
+      do { _ = try await server.start(); server.stop(); return port }
+      catch { server.stop() }
+    }
+    throw ZashDockError.server("测试无法绑定高位端口。")
   }
   func occupy(_ port: UInt16? = nil) async throws -> LoopbackHTTPServer {
     let server: LoopbackHTTPServer
@@ -198,6 +206,7 @@ struct PortMigrationTests {
         Set(fields.keys).isSubset(of: [
           "port", "quitAfterLastWindowCloses", "pendingOriginCleanup",
           "legacyStorageImported",
+          "automaticPortSelection",
         ]))
       #expect(data.range(of: Data("port-fixture-secret-one".utf8)) == nil)
       #expect(data.range(of: Data("setup/api-list".utf8)) == nil)
@@ -230,6 +239,7 @@ struct PortMigrationTests {
       let reservation = try await bindFixture(version.directoryURL)
       var configuration = AppConfiguration()
       configuration.port = reservation.port
+      configuration.automaticPortSelection = true
       reservation.stop()
       try ConfigurationStore(url: paths.configuration).save(configuration)
       return PortMigrationFixture(paths: paths, webRoot: version.directoryURL)
@@ -260,6 +270,15 @@ struct PortMigrationTests {
         model.phase == .uninstalled && model.currentVersion == nil && model.session == nil
           && model.server == nil && !model.isBusy)
       #expect(!FileManager.default.fileExists(atPath: fixture.paths.legacyStorage.path))
+      #expect(AutomaticPortPolicy.range.contains(model.configuration.port))
+      #expect(model.configuration.automaticPortSelection)
+      let savedPort = model.configuration.port
+      let savedConfiguration = try ConfigurationStore(url: fixture.paths.configuration).load()
+      #expect(savedConfiguration.port == savedPort)
+      await fixture.shutdown(model)
+      let restarted = fixture.model()
+      await restarted.start()
+      #expect(restarted.phase == .uninstalled && restarted.configuration.port == savedPort)
     }
   }
   @Test(.timeLimit(.minutes(1)))
@@ -324,11 +343,8 @@ struct PortMigrationTests {
       defer { blocker.stop() }
       let restarted = fixture.model()
       await restarted.start()
-      #expect(
-        restarted.phase == .unavailable && restarted.configuration.port == oldPort
-          && restarted.session == nil && restarted.server == nil)
-      let newPort = try await fixture.availablePort(excluding: [oldPort])
-      try await restarted.changePort(to: newPort)
+      let newPort = restarted.configuration.port
+      #expect(newPort != oldPort && AutomaticPortPolicy.range.contains(newPort))
       #expect(restarted.phase == .ready && restarted.configuration.port == newPort)
       try await assertSession(restarted, expected: expected)
       try await Task.sleep(for: .milliseconds(100))
@@ -336,6 +352,107 @@ struct PortMigrationTests {
       #expect(
         try await restarted.originStorage.read(origin: origin(oldPort))
           == OriginStoragePayload(localStorage: [:]))
+    }
+  }
+  @Test(.timeLimit(.minutes(1)))
+  func legacyConfigurationAutomaticallyMigratesBeforeTheFirstPageRead() async throws {
+    try await withFixture(installed: true) { fixture in
+      let store = ConfigurationStore(url: fixture.paths.configuration)
+      var legacy = try store.load()
+      legacy.automaticPortSelection = false
+      try store.save(legacy)
+      let target = try await fixture.availableHighPort(excluding: [legacy.port])
+      let model = fixture.model(portCandidates: { _ in [target] })
+      let expected = try expectedPayload()
+      try await model.originStorage.restore(expected, to: origin(legacy.port))
+      await model.start()
+      #expect(model.phase == .ready && model.configuration.port == target)
+      #expect(model.configuration.automaticPortSelection)
+      try await assertSession(model, expected: expected)
+      #expect(try store.load().port == target)
+      #expect(try await model.originStorage.read(origin: origin(legacy.port)) == OriginStoragePayload(localStorage: [:]))
+    }
+  }
+  @Test(.timeLimit(.minutes(1)))
+  func automaticSelectionSkipsOccupiedListenersAndOriginsWithExistingBusinessData() async throws {
+    try await withFixture(installed: true) { fixture in
+      let store = ConfigurationStore(url: fixture.paths.configuration)
+      var legacy = try store.load()
+      legacy.automaticPortSelection = false
+      try store.save(legacy)
+      let occupied = try await fixture.availableHighPort(excluding: [legacy.port])
+      _ = try await fixture.occupy(occupied)
+      let existing = try await fixture.availableHighPort(excluding: [legacy.port, occupied])
+      let target = try await fixture.availableHighPort(excluding: [legacy.port, occupied, existing])
+      let model = fixture.model(portCandidates: { _ in [occupied, existing, target] })
+      let expected = try expectedPayload()
+      let unrelated = OriginStoragePayload(localStorage: ["other-profile": "keep"])
+      try await model.originStorage.restore(expected, to: origin(legacy.port))
+      try await model.originStorage.restore(unrelated, to: origin(existing))
+      await model.start()
+      #expect(model.phase == .ready && model.configuration.port == target)
+      try await assertSession(model, expected: expected)
+      #expect(try await model.originStorage.read(origin: origin(existing)) == unrelated)
+    }
+  }
+  @Test(.timeLimit(.minutes(1)))
+  func exhaustedAutomaticCandidatesKeepConfigurationAndSourceDataUntouched() async throws {
+    try await withFixture(installed: true) { fixture in
+      let store = ConfigurationStore(url: fixture.paths.configuration)
+      var legacy = try store.load()
+      legacy.automaticPortSelection = false
+      try store.save(legacy)
+      let originalBytes = try Data(contentsOf: fixture.paths.configuration)
+      let occupied = try await fixture.availableHighPort(excluding: [legacy.port])
+      _ = try await fixture.occupy(occupied)
+      let model = fixture.model(portCandidates: { _ in [occupied] })
+      let expected = try expectedPayload()
+      try await model.originStorage.restore(expected, to: origin(legacy.port))
+      await model.start()
+      #expect(model.phase == .unavailable && model.session == nil && model.server == nil)
+      #expect(try Data(contentsOf: fixture.paths.configuration) == originalBytes)
+      #expect(try await model.originStorage.read(origin: origin(legacy.port)) == expected)
+      #expect(!model.canCancel && !model.isContentBlocked)
+    }
+  }
+  @Test(.timeLimit(.minutes(1)))
+  func firstInstallationRecoversWhenItsRememberedAddressBecomesOccupied() async throws {
+    try await withFixture(installed: false) { fixture in
+      let model = fixture.model()
+      await model.start()
+      let originalPort = model.configuration.port
+      _ = try await fixture.occupy(originalPort)
+      let expected = try expectedPayload()
+      try await model.originStorage.restore(expected, to: origin(originalPort))
+      let zip = fixture.paths.root.appendingPathComponent("first-install.zip")
+      try storedZIP().write(to: zip)
+      model.install(zip: zip)
+      await model.operation?.value
+      #expect(model.phase == .ready && model.errorMessage == nil)
+      #expect(model.configuration.port != originalPort && AutomaticPortPolicy.range.contains(model.configuration.port))
+      try await assertSession(model, expected: expected)
+    }
+  }
+  @Test(.timeLimit(.minutes(1)))
+  func repairingLegacyInstallationAlsoInitializesAnAutomaticHighPort() async throws {
+    try await withFixture(installed: true) { fixture in
+      let store = ConfigurationStore(url: fixture.paths.configuration)
+      var legacy = try store.load()
+      legacy.automaticPortSelection = false
+      try store.save(legacy)
+      try Data("damaged".utf8).write(to: fixture.webRoot.appendingPathComponent("index.html"))
+      let model = fixture.model()
+      let expected = try expectedPayload()
+      try await model.originStorage.restore(expected, to: origin(legacy.port))
+      await model.start()
+      #expect(model.phase == .damaged)
+      let zip = fixture.paths.root.appendingPathComponent("repair-install.zip")
+      try storedZIP().write(to: zip)
+      model.install(zip: zip)
+      await model.operation?.value
+      #expect(model.phase == .ready && model.errorMessage == nil)
+      #expect(model.configuration.automaticPortSelection && AutomaticPortPolicy.range.contains(model.configuration.port))
+      try await assertSession(model, expected: expected)
     }
   }
   @Test(.timeLimit(.minutes(1)))

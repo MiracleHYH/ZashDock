@@ -76,11 +76,13 @@ struct AppLifecycleTests {
             await model.start()
             model.checkForUpdates()
             let operation = try #require(model.operation)
+            #expect(model.isBusy && !model.isContentBlocked && model.canCancel)
             model.cancel()
             await operation.value
-            #expect(model.status == "已取消检查更新。")
+            #expect(model.updateCheckResult == "已取消检查更新。")
             #expect(model.errorMessage == nil && model.updater?.lastError == nil)
             #expect(!model.isBusy && model.operation == nil)
+            #expect(!model.isContentBlocked && !model.canCancel)
             #expect(await model.prepareToQuit())
         }
     }

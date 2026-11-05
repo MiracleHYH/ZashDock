@@ -149,6 +149,44 @@ struct WebFileInteractionTests {
         try await wait(session.page, expression: "window.exportStatus === 'cancelled'")
         #expect(try Data(contentsOf: saved) == bytes)
         #expect(panels.saveNames.count == 2)
+        #expect(panels.alertMessages.isEmpty && panels.failureCount == 0)
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: ["oversized", "revoked", "invalidPayload"])
+    func trustedExportRejectionExplainsTheFailureOnceWithoutOpeningSave(mode: String) async throws {
+        let script = """
+        window.exportStatus='';window.exportResultCount=0;
+        addEventListener('zashdock-export-result',event=>{window.exportStatus=event.detail;window.exportResultCount++;});
+        window.exportSettings=()=>{
+          const blob=new Blob([mode==='oversized'?new Uint8Array(\(WebExportPayload.maximumBytes + 1)):'{}'],{type:'application/json'});
+          const url=URL.createObjectURL(blob),anchor=document.createElement('a');
+          anchor.href=url;anchor.download=mode==='invalidPayload'?'../invalid.json':'settings.json';
+          if(mode==='revoked')URL.revokeObjectURL(url);
+          anchor.click();URL.revokeObjectURL(url);
+        };
+        document.getElementById('action').onclick=event=>{window.lastClickWasTrusted=event.isTrusted;window.exportSettings();};
+        """
+        let root = try fixture("const mode='\(mode)';\n" + script)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let server = try await bindFixture(root); defer { server.stop() }
+        let panels = FixtureWebPanels()
+        let session = WebSession(origin: server.baseURL, dataStore: .nonPersistent(), panels: panels); defer { session.stop() }
+        let window = host(session.page); defer { window.close() }
+        try await session.loadAndVerify()
+        try await click(window)
+        try await wait(session.page, expression: "window.exportStatus === 'rejected' && window.exportResultCount === 1")
+        #expect(try await session.page.callJavaScript("return window.lastClickWasTrusted;") as? Bool == true)
+        #expect(panels.saveNames.isEmpty && panels.failureCount == 0)
+        let message = try #require(panels.alertMessages.first)
+        #expect(panels.alertMessages.count == 1)
+        if mode == "oversized" { #expect(message.contains("16 MiB")) }
+        else if mode == "revoked" { #expect(message.contains("重新点击导出")) }
+        else { #expect(message.contains("格式或名称无效")) }
+
+        // A repeated programmatic request cannot reuse the click to repeat the alert.
+        try await session.page.callJavaScript("window.exportSettings();")
+        try await wait(session.page, expression: "window.exportResultCount === 2")
+        #expect(panels.alertMessages.count == 1 && panels.saveNames.isEmpty)
     }
 
     @Test(.timeLimit(.minutes(1)))
@@ -247,7 +285,11 @@ struct WebFileInteractionTests {
         try await session.page.callJavaScript("document.getElementById('action').click();")
         try await wait(session.page, expression: "window.exportStatus === 'rejected'")
         #expect(panels.saveNames.isEmpty)
+        #expect(panels.alertMessages.isEmpty && panels.failureCount == 0)
         #expect(try await session.page.callJavaScript("return typeof window.webkit.messageHandlers.zashdockExportGesture;") as? String == "undefined")
+        let backgroundFailure = try await session.page.callJavaScript("return await window.webkit.messageHandlers.zashdockExport.postMessage({schema:1,exportError:'tooLarge'});") as? [String: String]
+        #expect(backgroundFailure?["status"] == "rejected")
+        #expect(panels.alertMessages.isEmpty)
         // Use a separate unrestricted navigation fixture so the child really executes. Production denies its navigation.
         let controller = WKUserContentController()
         let interactions = WebInteractionCoordinator(origin: server.baseURL, controller: controller, panels: panels)
@@ -263,21 +305,26 @@ struct WebFileInteractionTests {
         try await page.callJavaScript("""
         document.getElementById('action').onclick = () => {
           const frame = document.createElement('iframe');
-          frame.srcdoc = '<script>window.webkit.messageHandlers.zashdockExport.postMessage({schema:1,filename:"forged.json",mime:"application/json",base64:"e30="}).then(result => parent.subframeExportStatus = result.status);<' + '/script>';
+          frame.srcdoc = '<script>window.webkit.messageHandlers.zashdockExport.postMessage({schema:1,filename:"forged.json",mime:"application/json",base64:"e30="}).then(result => parent.subframeExportStatus = result.status);window.webkit.messageHandlers.zashdockExport.postMessage({schema:1,exportError:"tooLarge"}).then(result => parent.subframeFailureStatus = result.status);<' + '/script>';
           document.body.appendChild(frame);
         };
         """)
         try await click(window)
         try await wait(page, expression: "window.subframeExportStatus === 'rejected'")
+        try await wait(page, expression: "window.subframeFailureStatus === 'rejected'")
         #expect(panels.saveNames.isEmpty)
+        #expect(panels.alertMessages.isEmpty && panels.failureCount == 0)
         let foreignRoot = try fixture(); defer { try? FileManager.default.removeItem(at: foreignRoot) }
         let foreignServer = try await bindFixture(foreignRoot); defer { foreignServer.stop() }
         for try await _ in page.load(URLRequest(url: foreignServer.baseURL)) {}
         #expect(try await page.callJavaScript("return confirm('foreign frame');") as? Bool == false)
         let foreignResult = try await page.callJavaScript("return await window.webkit.messageHandlers.zashdockExport.postMessage({schema:1,filename:'forged.json',mime:'application/json',base64:'e30='});") as? [String: String]
         #expect(foreignResult?["status"] == "rejected")
+        let foreignFailure = try await page.callJavaScript("return await window.webkit.messageHandlers.zashdockExport.postMessage({schema:1,exportError:'unavailable'});") as? [String: String]
+        #expect(foreignFailure?["status"] == "rejected")
         #expect(panels.confirmMessages.isEmpty)
         #expect(panels.saveNames.isEmpty)
+        #expect(panels.alertMessages.isEmpty && panels.failureCount == 0)
         #expect(!FileManager.default.fileExists(atPath: panels.destination!.path))
         #expect(!session.interactions.trusts(isMainFrame: true, url: URL(string: "https://example.com"), scheme: "https", host: "example.com", port: 443))
         #expect(!session.interactions.trusts(isMainFrame: false, url: server.baseURL, scheme: "http", host: "127.0.0.1", port: server.baseURL.port!))
@@ -354,6 +401,7 @@ struct WebFileInteractionTests {
         try await session.loadAndVerify(); try await click(window)
         try await wait(session.page, expression: "window.exportStatus === 'failed'")
         #expect(panels.failureCount == 1)
+        #expect(panels.alertMessages.isEmpty)
         #expect(!FileManager.default.fileExists(atPath: panels.destination!.path))
         let cancelledDestination = root.appendingPathComponent("cancelled.json")
         panels.destination = cancelledDestination
@@ -363,5 +411,6 @@ struct WebFileInteractionTests {
         try await wait(session.page, expression: "window.exportStatus === 'cancelled'")
         #expect(!FileManager.default.fileExists(atPath: cancelledDestination.path))
         #expect(panels.cancellationCount == 1)
+        #expect(panels.failureCount == 1 && panels.alertMessages.isEmpty)
     }
 }

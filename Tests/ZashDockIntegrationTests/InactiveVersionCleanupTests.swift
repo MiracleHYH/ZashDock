@@ -23,6 +23,7 @@ struct InactiveVersionCleanupTests {
             .write(to: paths.root.appendingPathComponent("versions-state.json"))
         let reservation = try await bindFixture(current.directoryURL)
         var configuration = AppConfiguration(); configuration.port = reservation.port
+        configuration.automaticPortSelection = true
         reservation.stop(); try ConfigurationStore(url: paths.configuration).save(configuration)
         let fixture = PortMigrationFixture(paths: paths, webRoot: current.directoryURL)
         let expected = OriginStoragePayload(localStorage: fixtureRemoteStorage(), databases: fixtureBusinessDatabases())
@@ -56,6 +57,7 @@ struct InactiveVersionCleanupTests {
             .write(to: paths.root.appendingPathComponent("versions-state.json"))
         let reservation = try await bindFixture(old.directoryURL)
         var configuration = AppConfiguration(); configuration.port = reservation.port
+        configuration.automaticPortSelection = true
         reservation.stop(); try ConfigurationStore(url: paths.configuration).save(configuration)
         let fixture = PortMigrationFixture(paths: paths, webRoot: old.directoryURL)
         let expected = OriginStoragePayload(localStorage: fixtureRemoteStorage(), databases: fixtureBusinessDatabases())
